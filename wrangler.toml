@@ -1,0 +1,30 @@
+name = "cdt-monitor"
+main = "worker.js"
+compatibility_date = "2026-10-06"
+
+# 预览 URL 关掉，少一个暴露面（不影响 workers.dev 主地址）。
+preview_urls = false
+
+# ⚠️ workers_dev 保持开启 —— 面板靠 https://<worker>.<subdomain>.workers.dev 访问。
+#    代价：这个登录页没有速率限制，而面板后面存着能开机停机的 AK/SK。所以必须：
+#      1. ADMIN_PASS 用 wrangler secret 设强密码（不要用面板里设的那个）；
+#      2. 有条件就挂自定义域名 + Cloudflare Access，然后取消下面这行的注释。
+# workers_dev = false
+
+[[kv_namespaces]]
+binding = "STATE_KV"
+# 换成你自己的：npx wrangler kv namespace create STATE_KV
+id = "REPLACE_WITH_YOUR_KV_NAMESPACE_ID"
+
+[[durable_objects.bindings]]
+name = "ENGINE_DO"
+class_name = "EngineCoordinator"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["EngineCoordinator"]
+
+[triggers]
+crons = ["* * * * *"]
+
+# ADMIN_PASS is a Worker Secret; do not write the real password here.

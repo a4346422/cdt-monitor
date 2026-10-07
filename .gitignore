@@ -1,0 +1,13 @@
+node_modules/
+.wrangler/
+.dev.vars
+.dev.vars.*
+.env
+.env.*
+
+# 测试生成的中间产物，每次运行都会重建
+temp/worker-test.mjs
+temp/dryout/
+
+# 旧 git 历史备份（含旧 namespace id），永不提交
+temp/git-history-backup.tar.gz
