@@ -1899,7 +1899,12 @@ async function doLogout(){ await api('/api/logout', { method:'POST' }); showLogi
 async function act(action){
   try {
     const r = await api('/api/action', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ action }) });
-    if (r && r.cleared === false) alert('未能清除：' + (r.notes || []).join('；'));
+    if (action === 'test_tg') {
+      if (r && r.ok) alert('测试消息已发送');
+      else if (r && r.skipped) alert('未发送：Telegram 未启用或缺少 Bot Token / Chat ID');
+      else if (r && r.error) alert('发送失败：' + r.error);
+      else alert('发送结果未知');
+    } else if (r && r.cleared === false) alert('未能清除：' + (r.notes || []).join('；'));
     else if (r && r.cleared === true) alert('已清除保护状态。' + (r.notes || []).join('；'));
     else if (r && r.halted) alert('已进入保护状态：' + (r.fault?.code || ''));
     else if (r && r.error) alert(r.error);
@@ -1970,7 +1975,7 @@ function renderAccounts(){
       + (!a.configured ? '<p class="text-[10px] text-amber-600 font-bold">未配置完整（缺 AK/SK/地域/实例 ID）</p>' : '')
       + (a.ecsError ? '<p class="text-[10px] text-rose-600">' + esc(a.ecsError) + '</p>' : '')
       + '<div>'
-      +   '<div class="flex justify-between text-[11px] mb-1"><span class="text-zinc-500">流量</span><span class="font-bold text-zinc-800">' + (a.trafficGb ?? '-') + ' / ' + a.threshold + ' GB</span></div>'
+      +   '<div class="flex justify-between text-[11px] mb-1"><span class="text-zinc-500">流量</span><span class="font-bold text-zinc-800">' + (a.trafficGb ?? '-') + ' / ' + a.threshold + ' GB（阈值）</span></div>'
       +   '<div class="h-1.5 rounded-full bg-zinc-100 overflow-hidden"><div class="h-full ' + barColor(tp) + '" style="width:' + tp + '%"></div></div>'
       + '</div>'
       + (a.billThreshold > 0
