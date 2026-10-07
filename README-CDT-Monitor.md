@@ -396,10 +396,11 @@ EIP、OSS 等一切在花钱的东西 —— 它们烧的是同一个额度池�
 2. **账单阈值挡不住当天超额。** BSS 有 24 小时延迟（§5.2）。
 3. **国际站的 BSS 接口可用性靠实测。** 官方文档提到国际站可能对部分 BSS 接口返回
    `NotApplicable`。用面板的「账单接口诊断」先验证再依赖。
-4. **`workers.dev` 上的登录页没有速率限制**，而面板后面存着 AK/SK。建议：
-   - 用 `ADMIN_PASS` secret 而不是 KV 里的密码；
-   - 或者挂自定义域名 + Cloudflare Access；
-   - 并在 `wrangler.toml` 里关掉 `preview_urls`（预览 URL 是第二个入口）。
+4. **`workers.dev` 上的登录页没有速率限制**，而面板后面存着 AK/SK。
+   默认 `workers_dev` 是**开着的**（否则没配路由时面板访问不了），所以必须：
+   - **用 `ADMIN_PASS` secret 设强密码**，不要用面板里设的那个；
+   - 有条件就挂自定义域名 + Cloudflare Access，再把 `workers_dev = false` 取消注释；
+   - `preview_urls` 已默认关掉（预览 URL 是第二个入口）。
 5. **账户余额 0 是正常的。** 按量付费（后付费）账号没有预存余额。
    真正该看的数字是「账单（账号级）」。
 

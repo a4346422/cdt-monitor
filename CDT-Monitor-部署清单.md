@@ -78,7 +78,6 @@ name = "cdt-monitor"
 main = "worker.js"
 compatibility_date = "YYYY-MM-DD"    # ← 第 0 步算出的 UTC 日期
 
-workers_dev = false
 preview_urls = false                 # 关掉预览 URL，少一个暴露面
 
 [[kv_namespaces]]
@@ -97,6 +96,24 @@ crons = ["* * * * *"]                # 每分钟巡检
 ```
 
 > **Durable Object 不需要手动创建**，`[[migrations]]` 会在首次部署时自动建。
+
+### ⚠️ `workers_dev`：面板的访问入口
+
+仓库里 `workers_dev` 是**注释掉的**（即保持开启），因为默认只靠
+`https://<worker>.<subdomain>.workers.dev` 访问面板。
+
+**代价：这个登录页没有速率限制，而面板后面存着能开机停机的 AK/SK。** 所以：
+
+- [ ] `ADMIN_PASS` 必须用 `npx wrangler secret put ADMIN_PASS` 设一个**强密码**；
+- [ ] 有条件的话，挂自定义域名 + Cloudflare Access，然后取消那行的注释：
+
+```toml
+routes = [{ pattern = "monitor.你的域名", custom_domain = true }]
+workers_dev = false                  # 有了路由再关
+```
+
+> ⚠️ **没有路由就关 `workers_dev`，面板会彻底访问不了**（cron 巡检不受影响，
+> 只是看不到界面）。恢复：把那行注释掉重新部署。
 
 ---
 
