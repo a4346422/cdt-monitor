@@ -1575,7 +1575,7 @@ export default {
         lastTrafficCheck: state.lastTrafficCheck,
         accounts,
         logs: logs.slice(0, 60),
-        config: publicConfig(cfg, env),
+        config: withLiveIps(publicConfig(cfg, env), state),
       });
     }
 
@@ -1628,6 +1628,18 @@ function publicConfig(cfg, env) {
     accounts: cfg.accounts.map((a) => ({ ...a, ak: mask(a.ak), sk: mask(a.sk) })),
     cf: { ...cfg.cf, apiToken: mask(cfg.cf.apiToken) },
     notify: { tg: { ...cfg.notify.tg, botToken: mask(cfg.notify.tg.botToken) } },
+  };
+}
+
+// 设置面板需要看到实例当前真实公网 IP（停机时 DescribeInstances 可能不返回），
+// 只用于展示，不写回配置。
+function withLiveIps(pub, state) {
+  return {
+    ...pub,
+    accounts: (pub.accounts || []).map((a) => ({
+      ...a,
+      liveEip: state?.accounts?.[a.id]?.ecsEip || null,
+    })),
   };
 }
 
@@ -1950,7 +1962,10 @@ function renderAccounts(){
   const list = STATE.accounts || [];
   document.getElementById('emptyHint').classList.toggle('hidden', list.length > 0);
   grid.innerHTML = list.map(function(a){
-    const tp = barPct(a.trafficGb, a.threshold);
+    // 进度条以免费限额（如非中国内地 200GB）为分母，阈值（如 188GB）单独显示并在条上打标记
+    const qp = barPct(a.trafficGb, a.quota);
+    const thresholdMark = (a.threshold > 0 && a.quota > 0 && a.threshold < a.quota)
+      ? barPct(a.threshold, a.quota) : null;
     const bp = barPct(a.billAccountAmount, a.billThreshold);
     const cls = a.trafficClass === 'china' ? '中国内地' : '非中国内地';
     const cur = a.billCurrency || '';
@@ -1975,8 +1990,11 @@ function renderAccounts(){
       + (!a.configured ? '<p class="text-[10px] text-amber-600 font-bold">未配置完整（缺 AK/SK/地域/实例 ID）</p>' : '')
       + (a.ecsError ? '<p class="text-[10px] text-rose-600">' + esc(a.ecsError) + '</p>' : '')
       + '<div>'
-      +   '<div class="flex justify-between text-[11px] mb-1"><span class="text-zinc-500">流量</span><span class="font-bold text-zinc-800">' + (a.trafficGb ?? '-') + ' / ' + a.threshold + ' GB（阈值）</span></div>'
-      +   '<div class="h-1.5 rounded-full bg-zinc-100 overflow-hidden"><div class="h-full ' + barColor(tp) + '" style="width:' + tp + '%"></div></div>'
+      +   '<div class="flex justify-between text-[11px] mb-1"><span class="text-zinc-500">流量</span><span class="font-bold text-zinc-800">' + (a.trafficGb ?? '-') + ' / ' + a.quota + ' GB（限额）</span></div>'
+      +   '<div class="relative h-1.5 rounded-full bg-zinc-100 overflow-hidden"><div class="h-full ' + barColor(qp) + '" style="width:' + qp + '%"></div>'
+      +     (thresholdMark != null ? '<div class="absolute top-0 h-full w-0.5 bg-zinc-700/60" style="left:' + thresholdMark + '%"></div>' : '')
+      +   '</div>'
+      +   '<div class="flex justify-between text-[10px] mt-1"><span class="text-zinc-400">阈值</span><span class="' + (a.exhausted ? 'text-rose-600 font-bold' : 'text-zinc-500') + '">' + a.threshold + ' GB</span></div>'
       + '</div>'
       + (a.billThreshold > 0
           ? '<div>'
@@ -1986,7 +2004,9 @@ function renderAccounts(){
           : row('账单（账号级）', money(a.billAccountAmount, cur)))
       + row('该实例费用', money(a.billInstanceAmount, cur))
       + row('账户余额', a.balanceOk ? money(a.balance, a.balanceCurrency || cur) : (a.configured ? '查询失败' : '-'))
-      + row('公网 IP', a.ecsEip ? esc(a.ecsEip) : '-')
+      + row('公网 IP', a.ecsEip
+          ? esc(a.ecsEip)
+          : (a.eip ? esc(a.eip) + ' <span class="text-[10px] text-zinc-400 font-normal">（配置）</span>' : '-'))
       + (a.eip && a.ecsEip && a.eip !== a.ecsEip
           ? '<p class="text-[10px] text-rose-600">⚠️ 与配置的 EIP 不一致：' + esc(a.eip) + '</p>'
           : '')
@@ -2087,6 +2107,7 @@ function accountRow(a, i){
     +     '<option value="china"' + sel(a.siteType === 'china') + '>中国站 (business.cn-hangzhou)</option>'
     +   '</select>'
     +   '<input data-f="eip" value="' + esc(a.eip) + '" placeholder="备用 EIP（可留空）" class="bg-zinc-50 border border-zinc-200 rounded-lg px-2 py-1.5 text-[11px]">'
+    +   (a.liveEip ? '<p class="text-[10px] text-zinc-400 md:col-span-2">当前实例公网 IP：' + esc(a.liveEip) + '</p>' : '')
     +   '<input data-f="remark" value="' + esc(a.remark) + '" placeholder="备注" class="bg-zinc-50 border border-zinc-200 rounded-lg px-2 py-1.5 text-[11px]">'
     +   '<input data-f="trafficThresholdGb" value="' + esc(a.trafficThresholdGb ?? '') + '" placeholder="流量阈值覆盖（留空=跟随全局）" class="bg-zinc-50 border border-zinc-200 rounded-lg px-2 py-1.5 text-[11px]">'
     +   '<input data-f="billThreshold" value="' + esc(a.billThreshold ?? '') + '" placeholder="账单阈值覆盖（留空=跟随全局）" class="bg-zinc-50 border border-zinc-200 rounded-lg px-2 py-1.5 text-[11px]">'
