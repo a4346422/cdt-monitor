@@ -3,7 +3,8 @@ import re, sys, pathlib
 
 root = pathlib.Path(__file__).resolve().parent.parent
 src = (root / 'worker.js').read_text(encoding='utf-8')
-readme = (root / 'README-CDT-Monitor.md').read_text(encoding='utf-8')
+readme_path = root / 'README.md' if (root / 'README.md').exists() else root / 'README-CDT-Monitor.md'
+readme = readme_path.read_text(encoding='utf-8')
 deploy = (root / 'CDT-Monitor-部署清单.md').read_text(encoding='utf-8')
 
 fails = []

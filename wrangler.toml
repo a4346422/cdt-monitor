@@ -16,15 +16,15 @@ binding = "STATE_KV"
 # 换成你自己的：npx wrangler kv namespace create STATE_KV
 id = "REPLACE_WITH_YOUR_KV_NAMESPACE_ID"
 
-[[durable_objects.bindings]]
-name = "ENGINE_DO"
-class_name = "EngineCoordinator"
-
 [[migrations]]
 tag = "v1"
 new_sqlite_classes = ["EngineCoordinator"]
 
+[[migrations]]
+tag = "v2"
+deleted_classes = ["EngineCoordinator"]
+
 [triggers]
-crons = ["* * * * *"]
+crons = ["*/2 * * * *"]
 
 # ADMIN_PASS is a Worker Secret; do not write the real password here.

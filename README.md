@@ -1,6 +1,6 @@
 # CDT Monitor
 
-阿里云多账号 CDT 免费流量调度器。跑在 Cloudflare Worker 上，用一个 Durable Object 串行化调度，
+阿里云多账号 CDT 免费流量调度器。跑在 Cloudflare Worker 上，调度状态由 Workers KV 存储，
 让一台域名始终指向「当前当班」的那台 ECS，并在账号免费额度快耗尽时自动换到下一个账号。
 
 > 部署步骤见 [CDT-Monitor-部署清单.md](CDT-Monitor-部署清单.md)。本文只讲**是什么**和**为什么**。
@@ -49,7 +49,7 @@
 
 ### 2.3 轮换触发
 
-每一分钟巡检一次，满足任一条件就换班：
+每 2 分钟巡检一次，满足任一条件就换班：
 
 - **当班账号耗尽** → 立刻换；
 - **定时轮换到期**：`rotationIntervalMinutes` 到了 → 换（`0` = 关闭，即只按流量/账单换）。
@@ -72,12 +72,12 @@
 
 ## 3. 关键机制
 
-### 3.1 Durable Object 是权威状态
+### 3.1 状态持久化与巡检周期
 
-所有状态存在 **Durable Object 的 SQLite**（键 `state_v2`），不是 KV。
+所有运行状态存放在 **Workers KV**（键 `state_v2`）。
+KV 统一承载状态（`state_v2`）、配置（`app_config`）、会话（`session:*`）与日志（`app_logs`）。
 
-DO 天然单线程，所有请求在 `run()` 里排队串行执行，替代了 KV 上做不了的并发写。
-KV 只用来存配置（`app_config`）、会话（`session:*`）和日志（`app_logs`）。
+巡检定时任务设为每 2 分钟触发一次（`*/2 * * * *`），每天执行 720 次，安全处于 Cloudflare Workers 免费套餐每日 1,000 次 KV 写入配额之内，且完全避开 Durable Objects 的时长限额。
 
 **不迁移旧版本状态。** 首次运行直接给一份干净的状态。
 
@@ -114,7 +114,7 @@ WAIT_STOP         停掉原当班实例，轮询确认 StopCharging
 - 整个流程有 `transitionTimeoutMinutes`（默认 10 分钟）超时保护，超时发**专用**的
   「⚠️ 【换班异常报告】」，包含两台实例的状态。
 - 目标实例启动失败**不会立刻报故障**，而是在 `startRetrySeconds`（默认 180 秒）窗口内
-  每分钟重试；窗口用尽才报 `START_FAILED`。这覆盖了抢占式实例的 `OperationDenied.NoStock`
+  每个巡检周期（每 2 分钟）重试；窗口用尽才报 `START_FAILED`。这覆盖了抢占式实例的 `OperationDenied.NoStock`
   （可用区暂时没有库存）这种稍后就好了的情况。
 - 遇到已经是 `Stopping` 的实例**不会重复发停机指令**（重复调用会返回 `IncorrectInstanceStatus`）。
 

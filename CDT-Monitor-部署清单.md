@@ -84,18 +84,19 @@ preview_urls = false                 # 关掉预览 URL，少一个暴露面
 binding = "STATE_KV"
 id = "..."
 
-[[durable_objects]]
-bindings = [{ name = "ENGINE_DO", class_name = "EngineCoordinator" }]
-
 [[migrations]]
 tag = "v1"
 new_sqlite_classes = ["EngineCoordinator"]
 
+[[migrations]]
+tag = "v2"
+deleted_classes = ["EngineCoordinator"]
+
 [triggers]
-crons = ["* * * * *"]                # 每分钟巡检
+crons = ["*/2 * * * *"]              # 每 2 分钟巡检（每天 720 次写入，处于 KV 免费额度 1000 次内）
 ```
 
-> **Durable Object 不需要手动创建**，`[[migrations]]` 会在首次部署时自动建。
+> **不需要 Durable Object**：状态已全部移至 KV 存储，免去 DO 时长超额风险。
 
 ### ⚠️ `workers_dev`：面板的访问入口
 
@@ -144,7 +145,7 @@ npx wrangler deploy --dry-run
 部署成功后记录：
 
 - Worker URL（形如 `https://cdt-monitor.<subdomain>.workers.dev`）
-- 绑定的 Durable Object 和 KV 名称
+- 绑定的 KV 命名空间名称
 
 > 如果 `workers_dev = false` 且没有自定义域名，会没有可访问的 URL。先确认这一点。
 
@@ -281,13 +282,13 @@ curl -s -X GET "https://api.cloudflare.com/client/v4/zones/<ZONE_ID>/dns_records
 ## 10. 第一次巡检
 
 - [ ] 点「立即巡检」
-- [ ] 等 30 秒刷新，或等下一分钟 cron
+- [ ] 等 30 秒刷新，或等下一次 cron（每 2 分钟）
 - [ ] 实例卡片显示流量数字、账单、余额、实例状态
 - [ ] **停机模式**行显示「节省停机」（如果是「仍在计费」，去控制台改成节省停机）
 - [ ] **公网 IP** 行与配置的 EIP 一致（不一致会红字告警）
 - [ ] 顶部显示当班账号
 
-如果第一台机器是停着的，保活会在**一分钟内**把它拉起来。
+如果第一台机器是停着的，保活会在**下一次巡检（2 分钟内）**把它拉起来。
 
 ### 建议的阈值设置
 
@@ -325,7 +326,7 @@ curl -s -X GET "https://api.cloudflare.com/client/v4/zones/<ZONE_ID>/dns_records
 
 ### 重置状态
 
-面板没有暴露重置按钮，需要直接调 DO：
+面板没有暴露重置按钮，需要调用 API：
 
 ```bash
 curl -X POST "https://<你的域名>/api/action" \
@@ -334,7 +335,7 @@ curl -X POST "https://<你的域名>/api/action" \
   -d '{"action":"reset_state"}'
 ```
 
-> 重置只清 Durable Object 里的状态，**不动 KV 里的配置**。账号和阈值会保留。
+> 重置只清 KV 里的运行状态（`state_v2`），**不动 KV 里的配置**（`app_config`）。账号和阈值会保留。
 
 ---
 

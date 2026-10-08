@@ -1285,7 +1285,7 @@ async function maybeDailyReport(env, cfg, state, engine) {
   if (!cfg.system.dailyReport) return;
   if (!cfg.accounts.length) return;
   const now = bjNow();
-  if (now.hhmm !== cfg.system.dailyReportTime) return;
+  if (now.hhmm < cfg.system.dailyReportTime) return;
   if (state.dailyReportDate === now.date) return;
   state.dailyReportDate = now.date;
   await engine.saveState(state);
@@ -1306,84 +1306,37 @@ async function maybeDailyReport(env, cfg, state, engine) {
 }
 
 // ============================================================================
-// Durable Object：串行化 + 权威状态
+// 状态管理（KV）
 // ============================================================================
 
-export class EngineCoordinator {
-  constructor(state, env) {
-    this.ctx = state;
-    this.env = env;
-    this.queue = Promise.resolve();
-  }
+function getEngine(env) {
+  return {
+    async loadState() {
+      const stored = await env.STATE_KV.get('state_v2', { type: 'json' });
+      if (stored) return { ...defaultState(), ...stored };
+      return defaultState();
+    },
+    async saveState(state) {
+      await env.STATE_KV.put('state_v2', JSON.stringify(state));
+    },
+    async resetState() {
+      await env.STATE_KV.delete('state_v2');
+      return defaultState();
+    },
+  };
+}
 
-  // 所有请求在 DO 内串行，替代 KV 上的并发写
-  async run(fn) {
-    const next = this.queue.then(fn, fn);
-    this.queue = next.catch(() => {});
-    return next;
-  }
-
-  async respond(fn) {
-    try {
-      return await this.run(fn);
-    } catch (e) {
-      return Response.json({ error: e.message }, { status: 500 });
-    }
-  }
-
-  async loadState() {
-    const stored = await this.ctx.storage.get('state_v2');
-    if (stored) return { ...defaultState(), ...stored };
-    // 首次运行：不迁移旧 KV 状态，直接给一份干净的
-    return defaultState();
-  }
-
-  async saveState(state) {
-    await this.ctx.storage.put('state_v2', state);
-  }
-
-  async fetch(request) {
-    const url = new URL(request.url);
-    const engine = this;
-
-    if (url.pathname === '/reset-state') {
-      return this.respond(async () => {
-        await this.ctx.storage.deleteAll();
-        return Response.json({ ok: true, state: await this.loadState() });
-      });
-    }
-    if (url.pathname === '/cron') {
-      return this.respond(async () => {
-        const result = await runEngineCron(this.env, engine);
-        await maybeDailyReport(this.env, await getConfig(this.env), await this.loadState(), engine);
-        return Response.json(result ?? { ok: true });
-      });
-    }
-    if (url.pathname === '/state') {
-      return this.respond(async () => Response.json(await this.loadState()));
-    }
-    if (url.pathname === '/clear-fault') {
-      return this.respond(async () => {
-        const cfg = await getConfig(this.env);
-        const state = await this.loadState();
-        const result = await reconcileAndClearFault(this.env, cfg, state, engine);
-        return Response.json(result);
-      });
-    }
-    if (url.pathname === '/probe-bill') {
-      return this.respond(async () => Response.json(await probeBilling(this.env)));
-    }
-    if (url.pathname === '/test-tg') {
-      return this.respond(async () => {
-        const cfg = await getConfig(this.env);
-        const r = await sendTelegram(this.env, cfg, '🔔 【测试消息】', [
-          ['来源', 'CDT-Monitor'],
-          ['时间', bjNow().iso],
-        ], '如果你看到这条消息，说明 Telegram 通知配置正确。');
-        return Response.json(r);
-      });
-    }
-    return new Response('Not found', { status: 404 });
+async function executeCron(env) {
+  try {
+    const engine = getEngine(env);
+    const result = await runEngineCron(env, engine);
+    const cfg = await getConfig(env);
+    const state = await engine.loadState();
+    await maybeDailyReport(env, cfg, state, engine);
+    return result ?? { ok: true };
+  } catch (e) {
+    await appendLogSafe(env, 'ERROR', 'Cron执行异常', e.message);
+    return { error: e.message };
   }
 }
 
@@ -1462,16 +1415,6 @@ async function reconcileAndClearFault(env, cfg, state, engine) {
 // HTTP 入口
 // ============================================================================
 
-function engineStub(env) {
-  const id = env.ENGINE_DO.idFromName('global');
-  return env.ENGINE_DO.get(id);
-}
-
-async function engineCall(env, path, init) {
-  const res = await engineStub(env).fetch(`https://do${path}`, init);
-  return res.json();
-}
-
 const SESSION_TTL_MS = 12 * 60 * 60 * 1000;
 
 function json(data, status = 200, headers = {}) {
@@ -1539,7 +1482,8 @@ export default {
     if (!(await getSession(env, request))) return json({ error: 'Unauthorized' }, 401);
 
     if (url.pathname === '/api/state') {
-      const state = await engineCall(env, '/state');
+      const engine = getEngine(env);
+      const state = await engine.loadState();
       const logs = await readLogs(env);
       const accounts = cfg.accounts.map((a) => {
         const st = state.accounts?.[a.id] || {};
@@ -1597,12 +1541,28 @@ export default {
 
     if (url.pathname === '/api/action' && request.method === 'POST') {
       const body = await request.json().catch(() => ({}));
+      const engine = getEngine(env);
       switch (body.action) {
-        case 'trigger_cron': return json(await engineCall(env, '/cron'));
-        case 'test_tg': return json(await engineCall(env, '/test-tg'));
-        case 'probe_bill': return json(await engineCall(env, '/probe-bill'));
-        case 'clear_fault': return json(await engineCall(env, '/clear-fault'));
-        case 'reset_state': return json(await engineCall(env, '/reset-state'));
+        case 'trigger_cron': return json(await executeCron(env));
+        case 'test_tg': {
+          const cfg = await getConfig(env);
+          const r = await sendTelegram(env, cfg, '🔔 【测试消息】', [
+            ['来源', 'CDT-Monitor'],
+            ['时间', bjNow().iso],
+          ], '如果你看到这条消息，说明 Telegram 通知配置正确。');
+          return json(r);
+        }
+        case 'probe_bill': return json(await probeBilling(env));
+        case 'clear_fault': {
+          const cfg = await getConfig(env);
+          const state = await engine.loadState();
+          const result = await reconcileAndClearFault(env, cfg, state, engine);
+          return json(result);
+        }
+        case 'reset_state': {
+          const state = await engine.resetState();
+          return json({ ok: true, state });
+        }
         case 'clear_logs':
           await env.STATE_KV.put('app_logs', '[]');
           return json({ ok: true });
@@ -1614,7 +1574,7 @@ export default {
   },
 
   async scheduled(event, env, ctx) {
-    ctx.waitUntil(engineCall(env, '/cron'));
+    ctx.waitUntil(executeCron(env));
   },
 };
 
@@ -2207,6 +2167,7 @@ async function saveSettings(){
 }
 
   export {
+  getEngine, executeCron,
   runEngineCron, defaultState, defaultConfig, trafficClass, quotaForClass,
   resolveTrafficThreshold, resolveBillThreshold, resolveKeepAlive, inTimeRange,
   evaluateExhausted, validateConfig, bssEndpoint, maybeDailyReport,
