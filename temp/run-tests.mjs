@@ -197,7 +197,7 @@ const M = await import(pathToFileURL(TESTMOD).href);
   runEngineCron, defaultState, trafficClass, quotaForClass,
   resolveTrafficThreshold, resolveBillThreshold, resolveKeepAlive,
   inTimeRange, evaluateExhausted, validateConfig, bssEndpoint,
-  probeBilling, reconcileAndClearFault, renderHtml,
+  probeBilling, reconcileAndClearFault, renderHtml, sanitizeConfig,
 } = M;
 
 // ============================================================================
@@ -823,6 +823,171 @@ console.log('\n[19] 实例卡片真的把停机模式渲染出来');
 
   globalThis.document = savedDoc;
   globalThis.fetch = savedFetch;
+}
+
+// ============================================================================
+console.log('\n[20] 分组独立调度与 DDNS 隔离');
+{
+  resetWorld();
+  // 分组 1: 默认组（未配置 DDNS & rotationIntervalMinutes=0）
+  // 分组 2: 轮换组（已配置 DDNS & rotationIntervalMinutes=60）
+  const accDef1 = acc('def1');
+  const accDef2 = acc('def2');
+  accDef1.groupId = 'group-default';
+  accDef2.groupId = 'group-default';
+
+  const accRotA = acc('rotA');
+  const accRotB = acc('rotB');
+  accRotA.groupId = 'group-rot';
+  accRotB.groupId = 'group-rot';
+
+  const accounts = [accDef1, accDef2, accRotA, accRotB];
+  seed(accounts, 'i-rotA');
+  // 保持 def1 开机，def2 关机
+  world.ecs['i-def1'].status = 'Running';
+  world.ecs['i-def2'].status = 'Stopped';
+  world.ecs['i-def2'].stoppedMode = 'StopCharging';
+
+  const cfg = baseConfig(accounts);
+  cfg.groups = [
+    { id: 'group-default', name: '默认分组', rotationIntervalMinutes: 0, cf: { enabled: false } },
+    {
+      id: 'group-rot',
+      name: '轮换组',
+      rotationIntervalMinutes: 60,
+      cf: { enabled: true, apiToken: 'tok-rot', zoneId: 'zone-rot', recordId: 'rec-rot', domainName: 'rot.example.com' }
+    }
+  ];
+
+  const env = makeEnv(cfg);
+  const eng = makeEngine(cfg);
+
+  // 首次运行：轮换组选出当班 rotA，默认组不选当班
+  await runEngineCron(env, eng);
+  let st = await eng.loadState();
+  check('默认组不选当班', !st.groups['group-default'].dutyAccountId, st.groups['group-default']);
+  check('轮换组选出当班 rotA', st.groups['group-rot'].dutyAccountId === 'rotA', st.groups['group-rot']);
+  check('默认组中原本开机的 def1 保持开机', world.ecs['i-def1'].status === 'Running', world.ecs['i-def1'].status);
+  check('默认组中原本关机的 def2 保持关机', world.ecs['i-def2'].status === 'Stopped', world.ecs['i-def2'].status);
+
+  // 模拟轮换组时间到期触发换班到 rotB
+  st.groups['group-rot'].dutySince = Date.now() - 65 * 60000;
+  await eng.saveState(st);
+
+  await runEngineCron(env, eng);
+  st = await eng.loadState();
+  check('轮换组进入 transition', !!st.groups['group-rot'].transition, st.groups['group-rot']);
+
+  let guard = 0;
+  while (st.groups['group-rot']?.transition && guard++ < 12) {
+    await runEngineCron(env, eng);
+    st = await eng.loadState();
+  }
+  check('轮换组换班收敛', !st.groups['group-rot'].transition, st.groups['group-rot']);
+  check('轮换组当班切到 rotB', st.groups['group-rot'].dutyAccountId === 'rotB', st.groups['group-rot']);
+  check('旧实例 rotA 已停机', world.stopCalls.includes('i-rotA'), world.stopCalls);
+  check('轮换组专属 DNS 指向 rotB IP', world.dns.content === world.ecs['i-rotB'].eip, world.dns.content);
+
+  // 确认在此期间默认分组实例完全未受干扰
+  check('默认组 def1 依然开机', world.ecs['i-def1'].status === 'Running', world.ecs['i-def1'].status);
+  check('默认组 def2 依然关机', world.ecs['i-def2'].status === 'Stopped', world.ecs['i-def2'].status);
+}
+
+// ============================================================================
+console.log('\n[21] DDNS 启用但无定时轮换：指定主实例与自动对齐');
+{
+  resetWorld();
+  const accA = acc('ddnsA');
+  const accB = acc('ddnsB');
+  accA.groupId = 'group-fixed';
+  accB.groupId = 'group-fixed';
+  const accounts = [accA, accB];
+  seed(accounts, 'i-ddnsA');
+  world.ecs['i-ddnsA'].status = 'Running';
+  world.ecs['i-ddnsB'].status = 'Stopped';
+  world.ecs['i-ddnsB'].stoppedMode = 'StopCharging';
+
+  const cfg = baseConfig(accounts);
+  cfg.groups = [
+    {
+      id: 'group-fixed',
+      name: '固定解析组',
+      rotationIntervalMinutes: 0,
+      primaryAccountId: 'ddnsB', // 显式指定主实例为 ddnsB
+      cf: { enabled: true, apiToken: 'tok-fix', zoneId: 'zone-fix', recordId: 'rec-fix', domainName: 'fixed.example.com' }
+    }
+  ];
+
+  const env = makeEnv(cfg);
+  const eng = makeEngine(cfg);
+
+  // 运行调度：虽然当前起着的是 ddnsA，但主实例指定为 ddnsB，系统选 ddnsB 为当班并对其解析
+  await runEngineCron(env, eng);
+  let st = await eng.loadState();
+  check('优先选定指定的主实例 ddnsB 当班', st.groups['group-fixed'].dutyAccountId === 'ddnsB', st.groups['group-fixed']);
+  check('DDNS 解析对齐到 ddnsB IP', world.dns.content === world.ecs['i-ddnsB'].eip, world.dns.content);
+}
+
+// ============================================================================
+console.log('\n[22] 动态切换主解析实例与分组防孤立兜底');
+{
+  resetWorld();
+  const acc1 = acc('inst1');
+  const acc2 = acc('inst2');
+  acc1.groupId = 'group-primary-switch';
+  acc2.groupId = 'group-primary-switch';
+  const accounts = [acc1, acc2];
+  seed(accounts, 'i-inst1');
+  world.ecs['i-inst1'].status = 'Running';
+  world.ecs['i-inst2'].status = 'Running';
+
+  const cfg = baseConfig(accounts);
+  cfg.groups = [
+    {
+      id: 'group-primary-switch',
+      name: '动态切换组',
+      rotationIntervalMinutes: 0,
+      primaryAccountId: 'inst1',
+      cf: { enabled: true, apiToken: 'tok-sw', zoneId: 'zone-sw', recordId: 'rec-sw', domainName: 'switch.example.com' }
+    }
+  ];
+
+  const env = makeEnv(cfg);
+  const eng = makeEngine(cfg);
+
+  // 第一次运行：解析到 inst1
+  await runEngineCron(env, eng);
+  let st = await eng.loadState();
+  check('初始主实例为 inst1', st.groups['group-primary-switch'].dutyAccountId === 'inst1', st.groups['group-primary-switch']);
+  check('DNS 指向 inst1 IP', world.dns.content === world.ecs['i-inst1'].eip, world.dns.content);
+
+  // 用户修改配置：主实例切换为 inst2
+  const updatedCfg = {
+    ...cfg,
+    accounts,
+    groups: [
+      {
+        ...cfg.groups[0],
+        primaryAccountId: 'inst2',
+      }
+    ]
+  };
+  await env.STATE_KV.put('app_config', JSON.stringify(updatedCfg));
+  const eng2 = makeEngine(st);
+  await runEngineCron(env, eng2);
+  st = await eng2.loadState();
+  check('动态切换后当班变为 inst2', st.groups['group-primary-switch'].dutyAccountId === 'inst2', st.groups['group-primary-switch']);
+  check('DNS 自动切换对齐到 inst2 IP', world.dns.content === world.ecs['i-inst2'].eip, world.dns.content);
+
+  // 孤立分组兜底验证：若账号关联的组被删除，sanitizeConfig/normalizeConfig 自动归入 defaultGid
+  const dirtyBody = {
+    groups: [{ id: 'group-remain', name: '保留组' }],
+    accounts: [
+      { id: 'inst-orphan', name: '孤立实例', groupId: 'group-deleted', ak: 'k', sk: 's' }
+    ]
+  };
+  const sanitized = sanitizeConfig(dirtyBody, cfg, env);
+  check('已被删除分组的实例自动回退到 defaultGid', sanitized.accounts[0].groupId === 'group-remain', sanitized.accounts[0].groupId);
 }
 
 console.log(`\n${pass} passed, ${fail} failed`);

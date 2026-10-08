@@ -43,6 +43,32 @@ const REGIONS = [
 
 const REGION_LABEL = new Map(REGIONS);
 
+function defaultGroup() {
+  return {
+    id: 'group-default',
+    name: '默认分组',
+    rotationIntervalMinutes: 0,
+    primaryAccountId: '',
+    cf: { enabled: false, apiToken: '', zoneId: '', recordId: '', domainName: '' },
+  };
+}
+
+function normalizeGroup(g) {
+  return {
+    id: g?.id || 'group-default',
+    name: g?.name || '默认分组',
+    rotationIntervalMinutes: num(g?.rotationIntervalMinutes, 0),
+    primaryAccountId: g?.primaryAccountId || '',
+    cf: {
+      enabled: !!g?.cf?.enabled,
+      apiToken: g?.cf?.apiToken || '',
+      zoneId: g?.cf?.zoneId || '',
+      recordId: g?.cf?.recordId || '',
+      domainName: g?.cf?.domainName || '',
+    },
+  };
+}
+
 function defaultConfig() {
   return {
     adminPass: '',
@@ -51,7 +77,7 @@ function defaultConfig() {
       trafficThresholdChina: Math.round(QUOTA_CHINA_GB * 0.9),
       trafficThresholdIntl: Math.round(QUOTA_INTL_GB * 0.94),
       billThreshold: 0,              // 0 = 关闭按账单轮换
-      rotationIntervalMinutes: 0,    // 0 = 关闭定时轮换
+      rotationIntervalMinutes: 0,    // 0 = 关闭定时轮换（保留为全局缺省）
       keepAlive: true,               // 保活全局默认，单账号可覆盖
       dnsDrainSeconds: 60,
       transitionTimeoutMinutes: 10,
@@ -60,6 +86,7 @@ function defaultConfig() {
       dailyReport: false,
       dailyReportTime: '23:58',
     },
+    groups: [defaultGroup()],
     accounts: [],                    // 默认没有任何实例，用户手动添加
     cf: { apiToken: '', zoneId: '', recordId: '', domainName: '' },
     notify: { tg: { enabled: false, botToken: '', chatId: '' } },
@@ -72,6 +99,7 @@ function defaultState() {
     dutyAccountId: null,
     dutySince: 0,
     rotationIndex: 0,
+    groups: {},            // groupId -> { dutyAccountId, dutySince, rotationIndex, transition, startAttempt, fusedMonth }
     accounts: {},          // id -> { trafficGb, trafficClass, billAmount, billOk, exhausted, reason, ... }
     transition: null,
     startAttempt: null,
@@ -538,8 +566,9 @@ async function probeBilling(env) {
 // Cloudflare DDNS
 // ============================================================================
 
-async function getDnsRecord(cfg) {
-  const { apiToken, zoneId, recordId } = cfg.cf || {};
+async function getDnsRecord(cfCfg) {
+  const cf = cfCfg?.cf || cfCfg || {};
+  const { apiToken, zoneId, recordId } = cf;
   if (!apiToken || !zoneId || !recordId) return { ok: false, message: 'Cloudflare 参数缺失' };
   try {
     const res = await fetch(`https://api.cloudflare.com/client/v4/zones/${zoneId}/dns_records/${recordId}`, {
@@ -554,8 +583,9 @@ async function getDnsRecord(cfg) {
   }
 }
 
-async function putDnsRecord(cfg, ip) {
-  const { apiToken, zoneId, recordId, domainName } = cfg.cf || {};
+async function putDnsRecord(cfCfg, ip) {
+  const cf = cfCfg?.cf || cfCfg || {};
+  const { apiToken, zoneId, recordId, domainName } = cf;
   if (!apiToken || !zoneId || !recordId || !domainName || !ip) return { ok: false, message: 'Cloudflare 参数或 IP 缺失' };
   try {
     const res = await fetch(`https://api.cloudflare.com/client/v4/zones/${zoneId}/dns_records/${recordId}`, {
@@ -573,15 +603,15 @@ async function putDnsRecord(cfg, ip) {
 }
 
 // 先查后写，写完再查一次确认
-async function ensureDns(cfg, ip) {
-  const before = await getDnsRecord(cfg);
+async function ensureDns(cfCfg, ip) {
+  const before = await getDnsRecord(cfCfg);
   if (!before.ok) return { ok: false, message: `DNS 查询失败: ${before.message}` };
   if (before.content === ip) return { ok: true, message: `已指向 ${ip}`, changed: false };
 
-  const put = await putDnsRecord(cfg, ip);
+  const put = await putDnsRecord(cfCfg, ip);
   if (!put.ok) return { ok: false, message: `DNS 更新失败: ${put.message}` };
 
-  const after = await getDnsRecord(cfg);
+  const after = await getDnsRecord(cfCfg);
   if (!after.ok) return { ok: false, message: `DNS 二次校验失败: ${after.message}` };
   if (after.content !== ip) return { ok: false, message: `DNS 二次校验不一致: ${after.content} != ${ip}` };
   return { ok: true, message: `已更新为 ${ip}`, changed: true };
@@ -626,19 +656,50 @@ async function getConfig(env) {
   const raw = await env.STATE_KV.get('app_config', { type: 'json' });
   const base = defaultConfig();
   if (!raw) return base;
+
+  let groups = Array.isArray(raw.groups) ? raw.groups.map(normalizeGroup) : null;
+  if (!groups || groups.length === 0) {
+    const legacyCf = raw.cf || base.cf;
+    const hasLegacyCf = !!(legacyCf?.apiToken || legacyCf?.zoneId || legacyCf?.domainName);
+    const rotationInterval = num(raw.system?.rotationIntervalMinutes, 0);
+    groups = [{
+      id: 'group-default',
+      name: '默认分组',
+      rotationIntervalMinutes: rotationInterval,
+      primaryAccountId: '',
+      cf: {
+        enabled: hasLegacyCf || rotationInterval > 0,
+        apiToken: legacyCf?.apiToken || '',
+        zoneId: legacyCf?.zoneId || '',
+        recordId: legacyCf?.recordId || '',
+        domainName: legacyCf?.domainName || '',
+      },
+    }];
+  }
+
+  const defaultGid = groups[0].id;
+  const validGids = new Set(groups.map((g) => g.id));
+  const accounts = Array.isArray(raw.accounts)
+    ? raw.accounts.map((a) => normalizeAccount(a, defaultGid, validGids))
+    : [];
+
   return {
     ...base,
     ...raw,
     system: { ...base.system, ...(raw.system || {}) },
+    groups,
     cf: { ...base.cf, ...(raw.cf || {}) },
     notify: { tg: { ...base.notify.tg, ...(raw.notify?.tg || {}) } },
-    accounts: Array.isArray(raw.accounts) ? raw.accounts.map(normalizeAccount) : [],
+    accounts,
   };
 }
 
-function normalizeAccount(a) {
+function normalizeAccount(a, defaultGid = 'group-default', validGids = null) {
+  const rawGid = a.groupId || defaultGid;
+  const groupId = (validGids && !validGids.has(rawGid)) ? defaultGid : rawGid;
   return {
     id: a.id || crypto.randomUUID(),
+    groupId,
     name: a.name || '未命名',
     ak: a.ak || '',
     sk: a.sk || '',
@@ -769,12 +830,48 @@ function findAccount(cfg, id) {
   return cfg.accounts.find((a) => a.id === id) || null;
 }
 
-// 按 round-robin 顺序取下一个候选
-function pickNextDuty(cfg, state, excludeId) {
-  const n = cfg.accounts.length;
+function findGroup(cfg, groupId) {
+  return (cfg.groups || []).find((g) => g.id === groupId) || null;
+}
+
+// 获取或初始化某个分组在 state 中的独立调度状态
+function getGroupSchedule(state, groupId) {
+  if (!state.groups) state.groups = {};
+  if (!state.groups[groupId]) {
+    state.groups[groupId] = {
+      dutyAccountId: null,
+      dutySince: 0,
+      rotationIndex: 0,
+      transition: null,
+      startAttempt: null,
+      fusedMonth: null,
+    };
+  }
+  return state.groups[groupId];
+}
+
+// 兼容单组/旧版逻辑，同步全局状态视图（以默认组或首个配置组为准）
+function syncLegacyStateView(state, cfg) {
+  const primaryGid = cfg.groups?.[0]?.id || 'group-default';
+  const gSched = getGroupSchedule(state, primaryGid);
+  state.dutyAccountId = gSched.dutyAccountId;
+  state.dutySince = gSched.dutySince;
+  state.rotationIndex = gSched.rotationIndex;
+  // 保持全局 transition 与任意正在换班的组同步，避免被无换班的主组清空
+  const anyTr = Object.values(state.groups || {}).find((g) => g?.transition)?.transition || gSched.transition || null;
+  state.transition = anyTr;
+  state.startAttempt = gSched.startAttempt;
+  state.fusedMonth = gSched.fusedMonth;
+}
+
+// 按 round-robin 顺序取下一个候选（支持组内或全局）
+function pickNextDuty(cfg, state, excludeId, targetAccounts = null, rotationIndex = 0) {
+  const pool = targetAccounts || cfg.accounts;
+  const n = pool.length;
+  if (n <= 1) return null;
   for (let i = 1; i <= n; i++) {
-    const idx = (state.rotationIndex + i) % n;
-    const acc = cfg.accounts[idx];
+    const idx = (rotationIndex + i) % n;
+    const acc = pool[idx];
     if (acc.id === excludeId) continue;
     if (state.accounts[acc.id]?.exhausted) continue;
     return { acc, idx };
@@ -844,7 +941,17 @@ async function runEngineCron(env, engine) {
   });
 
   // ---- 有换班在推进时，先把它推完
-  if (state.transition) return advanceTransition(env, cfg, state, engine, now);
+  let activeTr = state.transition;
+  if (!activeTr && state.groups) {
+    for (const gid of Object.keys(state.groups)) {
+      if (state.groups[gid]?.transition) {
+        activeTr = state.groups[gid].transition;
+        state.transition = activeTr;
+        break;
+      }
+    }
+  }
+  if (activeTr) return advanceTransition(env, cfg, state, engine, now);
 
   // ---- 采集所有账号的流量
   const traffic = await Promise.all(cfg.accounts.map((acc) => getCdtTraffic(acc)));
@@ -911,62 +1018,144 @@ async function runEngineCron(env, engine) {
 
   state.lastTrafficCheck = { at: now.iso };
 
-  // ---- 确定当班账号
-  let duty = findAccount(cfg, state.dutyAccountId);
-  if (!duty) {
-    const first = cfg.accounts.find((a) => !state.accounts[a.id]?.exhausted);
-    if (!first) {
-      if (state.fusedMonth !== state.month) {
-        state.fusedMonth = state.month;
-        await engine.saveState(state);
-        await appendLogSafe(env, 'AUDIT', '🔴 全部账号额度耗尽', `本月不再自动开机（${state.month}）`);
-        await sendTelegram(env, cfg, '🔴 【全部额度耗尽】', [
-          ['计费月', state.month],
-          ['账号数', String(cfg.accounts.length)],
-          ['状态', '所有账号本月额度已用完'],
-        ], '调度已停止，新计费月自动恢复。');
+  // ---- 按分组独立调度：未配置 DDNS / 轮换的分组（如默认组）实例保持不变，已配置的组组内轮换
+  const groups = (cfg.groups && cfg.groups.length > 0) ? cfg.groups : [defaultGroup()];
+  let cronResult = { ok: true };
+
+  for (const group of groups) {
+    const groupAccounts = cfg.accounts.filter((a) => (a.groupId || 'group-default') === group.id);
+    if (!groupAccounts.length) continue;
+
+    const gSched = getGroupSchedule(state, group.id);
+    const hasDdns = !!(group.cf && group.cf.enabled && group.cf.domainName && group.cf.apiToken);
+    const rotationMinutes = num(group.rotationIntervalMinutes, 0);
+
+    // 默认组或未配置 DDNS & 轮换的分组：组内实例保持自身开关状态，不选当班，不操作 DNS
+    if (!hasDdns && rotationMinutes <= 0) {
+      gSched.dutyAccountId = null;
+      gSched.dutySince = 0;
+      gSched.transition = null;
+      gSched.startAttempt = null;
+      continue;
+    }
+
+    // 若本组已在换班中，优先推进换班
+    if (gSched.transition) {
+      state.transition = gSched.transition;
+      return advanceTransition(env, cfg, state, engine, now);
+    }
+
+    // 若未开启定时轮换，优先检查是否应由用户指定的主实例（未耗尽）当班
+    if (rotationMinutes <= 0 && group.primaryAccountId) {
+      const preferred = groupAccounts.find((a) => a.id === group.primaryAccountId && !state.accounts[a.id]?.exhausted);
+      if (preferred && gSched.dutyAccountId !== preferred.id) {
+        gSched.dutyAccountId = preferred.id;
+        gSched.dutySince = Date.now();
+        gSched.rotationIndex = groupAccounts.findIndex((a) => a.id === preferred.id);
+        if (group.id === groups[0].id) {
+          state.dutyAccountId = preferred.id;
+          state.dutySince = gSched.dutySince;
+          state.rotationIndex = gSched.rotationIndex;
+        }
+        await appendLogSafe(env, 'AUDIT', `[${group.name}] 切换主解析实例`, preferred.name);
       }
+    } else {
+      // 若外部或测试直接修改了全局 state.dutyAccountId / state.dutySince，同步进主分组
+      if (group.id === groups[0].id && state.dutyAccountId && state.dutyAccountId !== gSched.dutyAccountId) {
+        gSched.dutyAccountId = state.dutyAccountId;
+        gSched.dutySince = state.dutySince || gSched.dutySince;
+        gSched.rotationIndex = (state.rotationIndex !== undefined) ? state.rotationIndex : gSched.rotationIndex;
+      } else if (group.id === groups[0].id && state.dutySince && state.dutySince !== gSched.dutySince) {
+        gSched.dutySince = state.dutySince;
+      }
+    }
+
+    let duty = groupAccounts.find((a) => a.id === gSched.dutyAccountId);
+    if (!duty) {
+      // 优先看是否配置了主实例（且未耗尽），否则取第 1 个未耗尽实例
+      const preferred = group.primaryAccountId
+        ? groupAccounts.find((a) => a.id === group.primaryAccountId && !state.accounts[a.id]?.exhausted)
+        : null;
+      const first = preferred || groupAccounts.find((a) => !state.accounts[a.id]?.exhausted);
+      if (!first) {
+        if (gSched.fusedMonth !== state.month) {
+          gSched.fusedMonth = state.month;
+          await engine.saveState(state);
+          await appendLogSafe(env, 'AUDIT', `🔴 [${group.name}] 全部实例额度耗尽`, `本月组内不再自动开机（${state.month}）`);
+          await sendTelegram(env, cfg, `🔴 【${group.name} 全部额度耗尽】`, [
+            ['计费月', state.month],
+            ['分组', group.name],
+            ['实例数', String(groupAccounts.length)],
+            ['状态', '组内所有实例额度已用完'],
+          ], '该分组调度已停止，新计费月自动恢复。');
+        }
+        continue;
+      }
+      duty = first;
+      gSched.dutyAccountId = first.id;
+      gSched.dutySince = Date.now();
+      gSched.rotationIndex = groupAccounts.findIndex((a) => a.id === first.id);
       await engine.saveState(state);
-      return { fused: true, reason: 'all_accounts_exhausted', month: state.month };
+      await appendLogSafe(env, 'AUDIT', `[${group.name}] 设定当班实例`, first.name);
     }
-    duty = first;
-    state.dutyAccountId = first.id;
-    state.dutySince = Date.now();
-    state.rotationIndex = cfg.accounts.findIndex((a) => a.id === first.id);
-    await engine.saveState(state);
-    await appendLogSafe(env, 'AUDIT', '设定当班账号', first.name);
+
+    const dutyState = state.accounts[duty.id];
+    const rotationMs = rotationMinutes * 60000;
+    const rotationDue = rotationMs > 0 && num(gSched.dutySince, 0) > 0 && (Date.now() - gSched.dutySince) >= rotationMs;
+    const needRotation = dutyState?.exhausted || rotationDue;
+
+    if (needRotation) {
+      const reason = dutyState?.exhausted ? `额度耗尽（${dutyState.reason}）` : '定时轮换到期';
+      const next = pickNextDuty(cfg, state, duty.id, groupAccounts, gSched.rotationIndex);
+      if (!next) {
+        const fRes = await fuseAndStopDuty(env, cfg, state, engine, duty, reason, group);
+        syncLegacyStateView(state, cfg);
+        return fRes;
+      }
+      const tRes = await beginTransition(env, cfg, state, engine, next.acc, duty, 'SHIFT', reason, group);
+      syncLegacyStateView(state, cfg);
+      return tRes;
+    }
+
+    // 保活：对配置了轮换/DDNS 分组的当班实例执行保活
+    const kRes = await keepAliveDuty(env, cfg, state, engine, duty, dutyState, now, group);
+    if (kRes && (kRes.halted || kRes.waiting)) {
+      syncLegacyStateView(state, cfg);
+      return kRes;
+    }
+
+    // 若配置了 DDNS 但未开启定时轮换（rotationMinutes = 0），自动对齐一次 DNS 解析到当前当班实例
+    if (hasDdns && rotationMinutes <= 0 && duty) {
+      const ecsDesc = state.accounts[duty.id];
+      const liveIp = ecsDesc?.ecsEip || duty.eip;
+      if (liveIp && gSched.lastSyncedDnsIp !== liveIp) {
+        const dnsRes = await ensureDns(group.cf, liveIp);
+        if (dnsRes.ok) {
+          gSched.lastSyncedDnsIp = liveIp;
+          await engine.saveState(state);
+          if (dnsRes.changed) {
+            await appendLogSafe(env, 'AUDIT', `[${group.name}] DDNS 解析对齐`, `${group.cf.domainName} -> ${liveIp}`);
+          }
+        }
+      }
+    }
   }
 
-  const dutyState = state.accounts[duty.id];
-
-  // ---- 是否需要换班
-  const rotationMs = num(cfg.system.rotationIntervalMinutes, 0) * 60000;
-  const rotationDue = rotationMs > 0 && num(state.dutySince, 0) > 0 && (Date.now() - state.dutySince) >= rotationMs;
-  const needRotation = dutyState?.exhausted || rotationDue;
-
-  if (needRotation) {
-    const reason = dutyState?.exhausted ? `额度耗尽（${dutyState.reason}）` : '定时轮换到期';
-    const next = pickNextDuty(cfg, state, duty.id);
-    if (!next) {
-      return fuseAndStopDuty(env, cfg, state, engine, duty, reason);
-    }
-    return beginTransition(env, cfg, state, engine, next.acc, duty, 'SHIFT', reason);
-  }
-
-  // ---- 保活：只对当班账号，且阈值熔断优先
-  return keepAliveDuty(env, cfg, state, engine, duty, dutyState, now);
+  syncLegacyStateView(state, cfg);
+  await engine.saveState(state);
+  return cronResult;
 }
 
 // ---------------------------------------------------------------- 保活
 
-async function keepAliveDuty(env, cfg, state, engine, duty, dutyState, now) {
+async function keepAliveDuty(env, cfg, state, engine, duty, dutyState, now, group = null) {
+  const gSched = group ? getGroupSchedule(state, group.id) : state;
   if (!isConfigured(duty)) {
     return setFault(env, engine, state, 'ACCOUNT_NOT_CONFIGURED', `${duty.name} 缺少 AK/SK/地域/实例 ID`);
   }
 
   const desc = await describeEcs(duty);
   if (!desc.ok) {
-    // 实例被抢占释放时是启不回来的，直接报明确故障而不是反复重试
     if (desc.status === 'NotFound') {
       return setFault(env, engine, state, 'INSTANCE_NOT_FOUND', `${duty.name}: 实例 ${duty.instanceId} 不存在或已被释放`, null, { accountId: duty.id });
     }
@@ -974,10 +1163,10 @@ async function keepAliveDuty(env, cfg, state, engine, duty, dutyState, now) {
   }
 
   if (desc.status === 'Running') {
-    state.startAttempt = null;
+    gSched.startAttempt = null;
     state.keepAliveAt = now.iso;
     await engine.saveState(state);
-    return { ok: true, duty: duty.id, status: 'Running', trafficGb: dutyState.trafficGb };
+    return { ok: true, duty: duty.id, status: 'Running', trafficGb: dutyState?.trafficGb };
   }
 
   // 保活开关 + 允许运行时段
@@ -991,15 +1180,15 @@ async function keepAliveDuty(env, cfg, state, engine, duty, dutyState, now) {
   }
 
   // 启动，带重试窗口
-  if (!state.startAttempt || state.startAttempt.targetId !== duty.id) {
-    state.startAttempt = { targetId: duty.id, since: Date.now(), attempts: 0, overLimitStopped: false };
+  if (!gSched.startAttempt || gSched.startAttempt.targetId !== duty.id) {
+    gSched.startAttempt = { targetId: duty.id, since: Date.now(), attempts: 0, overLimitStopped: false };
   }
-  const attempt = state.startAttempt;
+  const attempt = gSched.startAttempt;
   attempt.attempts += 1;
 
   const started = await startEcs(duty);
   if (started.ok) {
-    state.startAttempt = null;
+    gSched.startAttempt = null;
     state.keepAliveAt = now.iso;
     await engine.saveState(state);
     await appendLogSafe(env, 'AUDIT', '保活启动', `${duty.name}（原状态 ${desc.status}）`);
@@ -1007,7 +1196,7 @@ async function keepAliveDuty(env, cfg, state, engine, duty, dutyState, now) {
       ['账号', duty.name],
       ['实例', duty.instanceId],
       ['原状态', desc.status],
-      ['流量', `${dutyState.trafficGb} GB`],
+      ['流量', `${dutyState?.trafficGb ?? '-'} GB`],
     ], '检测到当班实例意外停止，已发送启动指令。');
     return { ok: true, duty: duty.id, keepAliveStarted: true };
   }
@@ -1024,7 +1213,8 @@ async function keepAliveDuty(env, cfg, state, engine, duty, dutyState, now) {
 
 // ---------------------------------------------------------------- 熔断
 
-async function fuseAndStopDuty(env, cfg, state, engine, duty, reason) {
+async function fuseAndStopDuty(env, cfg, state, engine, duty, reason, group = null) {
+  const gSched = group ? getGroupSchedule(state, group.id) : state;
   const desc = await describeEcs(duty);
   let detail = desc.ok ? `${desc.status}/${desc.stoppedMode}` : (desc.error || '状态未知');
   let confirmed = isStopChargingConfirmed(desc);
@@ -1035,23 +1225,24 @@ async function fuseAndStopDuty(env, cfg, state, engine, duty, reason) {
     detail = res.detail;
   }
 
-  state.dutyAccountId = null;
-  state.dutySince = 0;
-  state.fusedMonth = state.month;
-  state.transition = null;
-  state.startAttempt = null;
+  gSched.dutyAccountId = null;
+  gSched.dutySince = 0;
+  gSched.fusedMonth = state.month;
+  gSched.transition = null;
+  gSched.startAttempt = null;
   await engine.saveState(state);
 
-  await appendLogSafe(env, confirmed ? 'AUDIT' : 'ERROR', '🔴 全部账号额度耗尽', `${duty.name} 停机: ${detail}；触发原因: ${reason}`);
-  await sendTelegram(env, cfg, '🔴 【全部额度耗尽 · 已停机】', [
+  const groupLabel = group ? `[${group.name}] ` : '';
+  await appendLogSafe(env, confirmed ? 'AUDIT' : 'ERROR', `🔴 ${groupLabel}全部额度耗尽`, `${duty.name} 停机: ${detail}；触发原因: ${reason}`);
+  await sendTelegram(env, cfg, `🔴 【${groupLabel}全部额度耗尽 · 已停机】`, [
     ['计费月', state.month],
     ['当班账号', duty.name],
     ['触发原因', reason],
     ['停机确认', confirmed ? detail : `未确认（${detail}）`],
     ['账号数', String(cfg.accounts.length)],
   ], confirmed
-    ? '所有账号本月额度均已耗尽，当班实例已进入节省停机，新计费月自动恢复。'
-    : '所有账号额度耗尽，但当班实例停机未确认，请人工检查。');
+    ? '本月额度均已耗尽，当班实例已进入节省停机，新计费月自动恢复。'
+    : '额度耗尽，但当班实例停机未确认，请人工检查。');
 
   if (!confirmed) {
     return setFault(env, engine, state, 'FUSE_STOP_CHARGING_NOT_CONFIRMED', `${duty.name}: ${detail}`);
@@ -1061,7 +1252,8 @@ async function fuseAndStopDuty(env, cfg, state, engine, duty, reason) {
 
 // ---------------------------------------------------------------- 换班
 
-async function beginTransition(env, cfg, state, engine, target, off, type, reason) {
+async function beginTransition(env, cfg, state, engine, target, off, type, reason, group = null) {
+  const gSched = group ? getGroupSchedule(state, group.id) : state;
   const targetState = await describeEcs(target);
   if (!targetState.ok) {
     if (targetState.status === 'NotFound') {
@@ -1070,20 +1262,25 @@ async function beginTransition(env, cfg, state, engine, target, off, type, reaso
     return setFault(env, engine, state, 'ECS_DESCRIBE_FAILED', `${target.name}: ${targetState.error}`);
   }
 
+  const groupId = group ? group.id : (target.groupId || 'group-default');
+
   if (targetState.status === 'Running') {
-    state.transition = {
+    const tr = {
+      groupId,
       targetId: target.id, offId: off.id, type, reason,
       startTime: Date.now(), step: 'WAIT_DNS_DRAIN',
       dnsOk: false, dnsMsg: '待同步', dnsVerified: false, drainUntil: null,
     };
+    gSched.transition = tr;
+    state.transition = tr;
     await engine.saveState(state);
     return advanceTransition(env, cfg, state, engine, bjNow());
   }
 
-  if (!state.startAttempt || state.startAttempt.targetId !== target.id) {
-    state.startAttempt = { targetId: target.id, since: Date.now(), attempts: 0 };
+  if (!gSched.startAttempt || gSched.startAttempt.targetId !== target.id) {
+    gSched.startAttempt = { targetId: target.id, since: Date.now(), attempts: 0 };
   }
-  const attempt = state.startAttempt;
+  const attempt = gSched.startAttempt;
   attempt.attempts += 1;
 
   const started = await startEcs(target);
@@ -1096,10 +1293,10 @@ async function beginTransition(env, cfg, state, engine, target, off, type, reaso
     const offThreshold = resolveTrafficThreshold(off, cfg);
     if (offSt?.exhausted && offSt.trafficGb >= offThreshold && waited >= num(cfg.system.startRetrySeconds, 180) * 1000) {
       const res = await stopAndConfirm(off);
-      state.startAttempt = null;
-      state.dutyAccountId = null;
-      state.dutySince = 0;
-      state.fusedMonth = state.month;
+      gSched.startAttempt = null;
+      gSched.dutyAccountId = null;
+      gSched.dutySince = 0;
+      gSched.fusedMonth = state.month;
       await engine.saveState(state);
       await appendLogSafe(env, res.ok ? 'AUDIT' : 'ERROR', '🔴 超限停机执行', `${off.name}: ${res.detail}`);
       await sendTelegram(env, cfg, '🔴 【超限停机报告】', [
@@ -1120,15 +1317,18 @@ async function beginTransition(env, cfg, state, engine, target, off, type, reaso
     return { waiting: true, retrying: true, attempts: attempt.attempts, error: started.error };
   }
 
-  state.startAttempt = null;
-  state.transition = {
+  gSched.startAttempt = null;
+  const tr = {
+    groupId,
     targetId: target.id, offId: off.id, type, reason,
     startTime: Date.now(), step: 'WAIT_START',
     dnsOk: false, dnsMsg: '待同步', dnsVerified: false, drainUntil: null,
   };
+  gSched.transition = tr;
+  state.transition = tr;
   await engine.saveState(state);
   await appendLogSafe(env, 'AUDIT', '开始换班', `${off.name} -> ${target.name}（${reason}）`);
-  return { transition: state.transition };
+  return { transition: tr };
 }
 
 function transitionTimeoutMs(cfg) {
@@ -1196,7 +1396,10 @@ async function advanceTransition(env, cfg, state, engine, now) {
     const ip = desc.eip || target.eip;
     if (!ip) return setFault(env, engine, state, 'DNS_UPDATE_FAILED', `${target.name}: 实例没有公网 IP`);
 
-    const dns = await ensureDns(cfg, ip);
+    const grp = findGroup(cfg, tr.groupId || target.groupId);
+    const dnsCfg = (grp && grp.cf && grp.cf.enabled) ? grp.cf : cfg.cf;
+
+    const dns = await ensureDns(dnsCfg, ip);
     if (!dns.ok) {
       return setFault(env, engine, state, 'DNS_UPDATE_FAILED', `${target.name}: ${dns.message}`);
     }
@@ -1255,19 +1458,29 @@ async function advanceTransition(env, cfg, state, engine, now) {
 }
 
 async function finishTransition(env, cfg, state, engine, target, off, tr) {
-  state.dutyAccountId = target.id;
-  state.dutySince = Date.now();
-  state.rotationIndex = cfg.accounts.findIndex((a) => a.id === target.id);
+  const grpId = tr.groupId || target.groupId || 'group-default';
+  const grp = findGroup(cfg, grpId);
+  const grpAccounts = cfg.accounts.filter((a) => (a.groupId || 'group-default') === grpId);
+
+  const gSched = getGroupSchedule(state, grpId);
+  gSched.dutyAccountId = target.id;
+  gSched.dutySince = Date.now();
+  gSched.rotationIndex = grpAccounts.findIndex((a) => a.id === target.id);
+  gSched.transition = null;
+  gSched.startAttempt = null;
   state.transition = null;
-  state.startAttempt = null;
+
+  syncLegacyStateView(state, cfg);
   await engine.saveState(state);
 
   const t = state.accounts[target.id] || {};
   const o = state.accounts[off.id] || {};
-  await appendLogSafe(env, 'AUDIT', '换班完成', `${off.name} -> ${target.name}`);
+  const groupLabel = grp ? `[${grp.name}] ` : '';
+  await appendLogSafe(env, 'AUDIT', `${groupLabel}换班完成`, `${off.name} -> ${target.name}`);
 
   const titles = { SHIFT: '✅ 【换班完成报告】', TEMPORARY: '✅ 【临时换班完成报告】', RECOVERY: '✅ 【当班恢复报告】' };
-  await sendTelegram(env, cfg, titles[tr.type] || titles.SHIFT, [
+  await sendTelegram(env, cfg, (groupLabel ? `✅ 【${grp.name} 换班完成】` : (titles[tr.type] || titles.SHIFT)), [
+    ['所属分组', grp ? grp.name : '默认分组'],
     ['当班实例', `${target.name} (${target.regionId})`],
     ['离班实例', `${off.name} 已节省停机`],
     ['换班原因', tr.reason || '定时轮换'],
@@ -1381,12 +1594,25 @@ async function reconcileAndClearFault(env, cfg, state, engine) {
         state.rotationIndex = cfg.accounts.findIndex((x) => x.id === target.id);
         state.transition = null;
         state.startAttempt = null;
+
+        const grpId = tr.groupId || target.groupId || 'group-default';
+        const grpAccounts = cfg.accounts.filter((a) => (a.groupId || 'group-default') === grpId);
+        const gSched = getGroupSchedule(state, grpId);
+        gSched.dutyAccountId = target.id;
+        gSched.dutySince = Date.now();
+        gSched.rotationIndex = grpAccounts.findIndex((x) => x.id === target.id);
+        gSched.transition = null;
+        gSched.startAttempt = null;
+
         notes.push(`换班实际已完成，已确认 ${target.name} 为当班账号`);
       } else {
         notes.push('换班未完成，保留进度，下一次巡检将从真实状态继续');
       }
     } else {
       state.transition = null;
+      if (tr.groupId && state.groups?.[tr.groupId]) {
+        state.groups[tr.groupId].transition = null;
+      }
       notes.push('换班引用的实例已不存在，已清除换班进度');
     }
   }
@@ -1487,15 +1713,19 @@ export default {
       const logs = await readLogs(env);
       const accounts = cfg.accounts.map((a) => {
         const st = state.accounts?.[a.id] || {};
+        const gSched = getGroupSchedule(state, a.groupId || 'group-default');
+        const isDuty = gSched.dutyAccountId === a.id || state.dutyAccountId === a.id;
         return {
-          id: a.id, name: a.name, regionId: a.regionId, instanceId: a.instanceId,
+          id: a.id,
+          groupId: a.groupId || 'group-default',
+          name: a.name, regionId: a.regionId, instanceId: a.instanceId,
           siteType: a.siteType, remark: a.remark, eip: a.eip || '',
           trafficClass: trafficClass(a.regionId),
           threshold: resolveTrafficThreshold(a, cfg),
           quota: quotaForClass(trafficClass(a.regionId)),
           billThreshold: resolveBillThreshold(a, cfg),
           keepAlive: resolveKeepAlive(a, cfg),
-          duty: state.dutyAccountId === a.id,
+          duty: isDuty,
           exhausted: !!st.exhausted, reason: st.reason || '',
           trafficGb: st.trafficGb ?? null, breakdown: st.breakdown || [],
           billAccountAmount: st.billAmount ?? null,
@@ -1506,6 +1736,9 @@ export default {
           ecsStoppedMode: st.ecsStoppedMode || null, ecsEip: st.ecsEip || null,
           balance: st.balance ?? null, balanceCurrency: st.balanceCurrency || null, balanceOk: !!st.balanceOk,
           configured: isConfigured(a),
+          scheduleEnabled: !!a.scheduleEnabled,
+          startTime: a.startTime || '00:00',
+          stopTime: a.stopTime || '23:59',
         };
       });
       return json({
@@ -1513,6 +1746,7 @@ export default {
         month: state.month,
         dutyAccountId: state.dutyAccountId,
         dutySince: state.dutySince,
+        groups: state.groups || {},
         fused: state.fusedMonth === state.month,
         transition: state.transition,
         fault: state.fault,
@@ -1563,6 +1797,56 @@ export default {
           const state = await engine.resetState();
           return json({ ok: true, state });
         }
+        case 'start_instance': {
+          const cfg = await getConfig(env);
+          const acc = cfg.accounts.find((a) => a.id === body.accountId);
+          if (!acc) return json({ error: '实例不存在' }, 404);
+          if (!isConfigured(acc)) return json({ error: '实例配置不完整（缺 AK/SK/地域/实例 ID）' }, 400);
+          const started = await startEcs(acc);
+          if (!started.ok) return json({ error: started.error || '启动失败' }, 500);
+          await appendLogSafe(env, 'AUDIT', '手动启动实例', `${acc.name} (${acc.instanceId})`);
+          // 尝试同步一次 ECS 状态
+          const desc = await describeEcs(acc);
+          if (desc.ok) {
+            await engine.mutate((st) => {
+              const a = st.accounts[acc.id] || {};
+              st.accounts[acc.id] = {
+                ...a,
+                ecsStatus: desc.status,
+                ecsStoppedMode: desc.stoppedMode,
+                ecsEip: desc.eip || a.ecsEip,
+                ecsError: null,
+              };
+              return st;
+            });
+          }
+          return json({ ok: true });
+        }
+        case 'stop_instance': {
+          const cfg = await getConfig(env);
+          const acc = cfg.accounts.find((a) => a.id === body.accountId);
+          if (!acc) return json({ error: '实例不存在' }, 404);
+          if (!isConfigured(acc)) return json({ error: '实例配置不完整（缺 AK/SK/地域/实例 ID）' }, 400);
+          const stopped = await stopEcs(acc);
+          if (!stopped.ok) return json({ error: stopped.error || '停机失败' }, 500);
+          await appendLogSafe(env, 'AUDIT', '手动节省停机', `${acc.name} (${acc.instanceId})`);
+          // 尝试同步一次 ECS 状态
+          const desc = await describeEcs(acc);
+          if (desc.ok) {
+            await engine.mutate((st) => {
+              const a = st.accounts[acc.id] || {};
+              st.accounts[acc.id] = {
+                ...a,
+                ecsStatus: desc.status,
+                ecsStoppedMode: desc.stoppedMode,
+                ecsEip: desc.eip || a.ecsEip,
+                ecsError: null,
+              };
+              return st;
+            });
+          }
+          return json({ ok: true });
+        }
         case 'clear_logs':
           await env.STATE_KV.put('app_logs', '[]');
           return json({ ok: true });
@@ -1580,11 +1864,16 @@ export default {
 
 // 对外返回配置时把密钥打码，但不回传明文以外的字段
 function publicConfig(cfg, env) {
+  const groups = (cfg.groups || []).map((g) => ({
+    ...g,
+    cf: { ...g.cf, apiToken: mask(g.cf?.apiToken) },
+  }));
   return {
     ...cfg,
     adminPass: adminPassword(env, cfg) ? '******' : '',
     hasAdminPass: !!adminPassword(env, cfg),
     adminPassFromSecret: !!env.ADMIN_PASS,
+    groups,
     accounts: cfg.accounts.map((a) => ({ ...a, ak: mask(a.ak), sk: mask(a.sk) })),
     cf: { ...cfg.cf, apiToken: mask(cfg.cf.apiToken) },
     notify: { tg: { ...cfg.notify.tg, botToken: mask(cfg.notify.tg.botToken) } },
@@ -1615,18 +1904,45 @@ function isMasked(v) {
 
 function sanitizeConfig(body, prev, env) {
   const base = defaultConfig();
-  // 面板不会回传所有字段，缺失的必须沿用已有配置，
-  // 否则会被默认值默默覆盖（余额开关就是这么丢的）。
+  // 面板不会回传所有字段，缺失的必须沿用已有配置
   const sys = { ...base.system, ...(prev.system || {}), ...(body.system || {}) };
+
+  // 分组处理
+  let groups = prev.groups || [defaultGroup()];
+  if (Array.isArray(body.groups) && body.groups.length > 0) {
+    groups = body.groups.map((bg) => {
+      const existing = (prev.groups || []).find((g) => g.id === bg.id);
+      return {
+        id: bg.id || crypto.randomUUID(),
+        name: bg.name || '未命名分组',
+        rotationIntervalMinutes: num(bg.rotationIntervalMinutes, 0),
+        primaryAccountId: bg.primaryAccountId ?? existing?.primaryAccountId ?? '',
+        cf: {
+          enabled: !!bg.cf?.enabled,
+          apiToken: keepIfMasked(bg.cf?.apiToken, existing?.cf?.apiToken || ''),
+          zoneId: bg.cf?.zoneId ?? existing?.cf?.zoneId ?? '',
+          recordId: bg.cf?.recordId ?? existing?.cf?.recordId ?? '',
+          domainName: bg.cf?.domainName ?? existing?.cf?.domainName ?? '',
+        },
+      };
+    });
+  }
+
+  const defaultGid = groups[0]?.id || 'group-default';
+  const validGids = new Set(groups.map((g) => g.id));
+
+  const prevAccounts = Array.isArray(prev?.accounts) ? prev.accounts : [];
   const accounts = Array.isArray(body.accounts) ? body.accounts.map((raw) => {
-    const existing = prev.accounts.find((a) => a.id === raw.id);
+    const existing = prevAccounts.find((a) => a.id === raw.id);
     return normalizeAccount({
       ...raw,
       id: raw.id || crypto.randomUUID(),
+      groupId: raw.groupId || existing?.groupId || defaultGid,
       ak: keepIfMasked(raw.ak, existing?.ak || ''),
       sk: keepIfMasked(raw.sk, existing?.sk || ''),
-    });
-  }) : (prev.accounts || []);
+    }, defaultGid, validGids);
+  }) : prevAccounts;
+
   return {
     adminPass: env.ADMIN_PASS ? '' : (body.adminPass && !String(body.adminPass).includes('****') ? body.adminPass : prev.adminPass),
     system: {
@@ -1642,6 +1958,7 @@ function sanitizeConfig(body, prev, env) {
       keepAlive: !!sys.keepAlive,
       dailyReport: !!sys.dailyReport,
     },
+    groups,
     accounts,
     cf: {
       apiToken: keepIfMasked(body.cf?.apiToken, prev.cf.apiToken),
@@ -1673,16 +1990,44 @@ function renderHtml() {
 <title>CDT MONITOR</title>
 <script src="https://cdn.tailwindcss.com"></script>
 <style>
-  body { background:#f1f3f5; color:#18181b; font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif; }
-  .card { background:#fff; border:1px solid rgba(226,232,240,.9); box-shadow:0 1px 3px rgba(0,0,0,.03); }
+  body { background:#e5e7eb; color:#18181b; font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif; }
+  .inst-card {
+    background: #ffffff;
+    border: 1.5px solid #cbd5e1;
+    box-shadow: 0 1px 3px rgba(0,0,0,0.06);
+    cursor: default;
+    transition: background-color 0.12s ease, border-color 0.12s ease, box-shadow 0.12s ease;
+  }
+  .inst-card:hover {
+    background: #f8fafc !important;
+    border-color: #64748b !important;
+    box-shadow: 0 6px 16px -2px rgba(15, 23, 42, 0.12), 0 2px 4px -1px rgba(15, 23, 42, 0.06) !important;
+  }
+  .card-static {
+    background: #ffffff;
+    border: 1px solid #cbd5e1;
+    box-shadow: 0 1px 3px rgba(0,0,0,0.04);
+  }
+  .drag-handle { cursor: grab; }
+  .drag-handle:active { cursor: grabbing; }
   .hidden { display:none !important; }
+  .drag-over {
+    border-color: #4f46e5 !important;
+    background-color: #e0e7ff !important;
+    box-shadow: inset 0 0 0 2px #4f46e5 !important;
+  }
+  .dragging {
+    opacity: 0.65;
+    border-color: #4f46e5 !important;
+    background: #eef2ff !important;
+  }
 </style>
 </head>
 <body class="p-4 md:p-8 min-h-screen">
 <datalist id="regionList">${regionOptions}</datalist>
 
 <div id="loginView" class="hidden max-w-sm mx-auto mt-24">
-  <div class="card rounded-3xl p-8 space-y-4">
+  <div class="card-static rounded-3xl p-8 space-y-4">
     <h1 class="text-sm font-bold tracking-widest uppercase text-zinc-900">CDT MONITOR</h1>
     <p class="text-xs text-zinc-500">请输入管理员密码</p>
     <input id="loginPass" type="password" placeholder="管理员密码" class="w-full bg-zinc-50 border border-zinc-200 rounded-xl px-3 py-2 text-sm" onkeydown="if(event.key==='Enter')doLogin()">
@@ -1698,8 +2043,10 @@ function renderHtml() {
       <p id="dutyLine" class="text-[11px] text-zinc-500 mt-0.5">加载中…</p>
     </div>
     <div class="flex items-center gap-2">
-      <button onclick="act('trigger_cron')" class="px-3 py-1.5 rounded-xl bg-zinc-900 text-white text-xs font-bold">立即巡检</button>
-      <button onclick="openSettings()" class="px-3 py-1.5 rounded-xl bg-white border border-zinc-200 text-zinc-700 text-xs font-bold">设置</button>
+      <button onclick="addAccount()" class="px-3 py-1.5 rounded-xl bg-white hover:bg-zinc-100 border border-zinc-300 text-zinc-700 text-xs font-bold transition-colors shadow-sm">+ 添加实例</button>
+      <button onclick="openGroupSettings()" class="px-3 py-1.5 rounded-xl bg-white hover:bg-zinc-100 border border-zinc-300 text-zinc-700 text-xs font-bold transition-colors shadow-sm">📁 分组与 DDNS</button>
+      <button onclick="openGlobalSettings()" class="px-3 py-1.5 rounded-xl bg-white hover:bg-zinc-100 border border-zinc-300 text-zinc-700 text-xs font-bold transition-colors shadow-sm">⚙️ 全局设置</button>
+      <button onclick="act('trigger_cron')" class="px-3 py-1.5 rounded-xl bg-zinc-900 text-white text-xs font-bold shadow-sm">立即巡检</button>
       <button onclick="doLogout()" class="px-3 py-1.5 rounded-xl bg-white border border-zinc-200 text-zinc-700 text-xs font-bold">退出</button>
     </div>
   </header>
@@ -1716,30 +2063,28 @@ function renderHtml() {
     <p class="text-[11px] text-amber-700 mt-1">调度已停止，新计费月自动恢复。</p>
   </div>
 
-  <section>
-    <div class="flex justify-between items-center mb-3">
-      <h2 class="text-xs font-bold uppercase tracking-wider text-zinc-500">实例</h2>
-      <button onclick="addAccount()" class="px-3 py-1.5 rounded-xl bg-white border border-zinc-200 text-zinc-700 text-[11px] font-bold">+ 添加实例</button>
-    </div>
-    <div id="accountGrid" class="grid md:grid-cols-2 gap-4"></div>
-    <p id="emptyHint" class="hidden text-xs text-zinc-400 text-center py-10">还没有实例。点「+ 添加实例」开始。</p>
-  </section>
+  <!-- 分组与实例看板 (支持跨组拖拽) -->
+  <section class="space-y-6" id="groupSections"></section>
+  <p id="emptyHint" class="hidden text-xs text-zinc-400 text-center py-10">还没有实例。点「+ 添加实例」开始。</p>
 
-  <section class="card rounded-2xl p-4">
+  <section class="card-static rounded-2xl p-4">
     <h2 class="text-xs font-bold uppercase tracking-wider text-zinc-500 mb-3">日志</h2>
     <div id="logList" class="space-y-1 max-h-80 overflow-auto text-[11px]"></div>
   </section>
 </div>
 
-<div id="settingsModal" class="hidden fixed inset-0 bg-black/40 p-4 overflow-auto z-50">
-  <div class="card rounded-3xl max-w-3xl mx-auto my-8 p-6 space-y-5">
-    <div class="flex justify-between items-center">
-      <h2 class="text-sm font-bold text-zinc-900">设置</h2>
-      <button onclick="closeSettings()" class="text-zinc-400 text-lg leading-none">&times;</button>
+<!-- ============================================================================ -->
+<!-- 弹窗 1: 全局系统设置 -->
+<!-- ============================================================================ -->
+<div id="settingsModal" class="hidden fixed inset-0 bg-black/40 backdrop-blur-sm p-4 overflow-auto z-50 flex items-start justify-center">
+  <div class="card-static rounded-3xl w-full max-w-3xl my-8 p-6 space-y-5 shadow-2xl">
+    <div class="flex justify-between items-center border-b border-zinc-100 pb-3">
+      <h2 class="text-sm font-bold text-zinc-900">全局系统设置</h2>
+      <button onclick="closeGlobalSettings()" class="text-zinc-400 hover:text-zinc-600 text-2xl leading-none">&times;</button>
     </div>
 
     <div class="space-y-4">
-      <h3 class="text-[11px] font-bold uppercase tracking-wider text-zinc-400">额度与轮换</h3>
+      <h3 class="text-[11px] font-bold uppercase tracking-wider text-zinc-400">默认额度与全局保活</h3>
       <div class="grid md:grid-cols-3 gap-3">
         <label class="block"><span class="text-[11px] font-bold text-zinc-600">中国内地流量阈值 (GB)</span>
           <input id="s_trafficChina" type="number" class="w-full bg-zinc-50 border border-zinc-200 rounded-xl px-3 py-2 text-xs mt-1"></label>
@@ -1747,8 +2092,6 @@ function renderHtml() {
           <input id="s_trafficIntl" type="number" class="w-full bg-zinc-50 border border-zinc-200 rounded-xl px-3 py-2 text-xs mt-1"></label>
         <label class="block"><span class="text-[11px] font-bold text-zinc-600">账单阈值 (0=关闭)</span>
           <input id="s_billThreshold" type="number" class="w-full bg-zinc-50 border border-zinc-200 rounded-xl px-3 py-2 text-xs mt-1"></label>
-        <label class="block"><span class="text-[11px] font-bold text-zinc-600">定时轮换 (分钟, 0=关闭)</span>
-          <input id="s_rotation" type="number" class="w-full bg-zinc-50 border border-zinc-200 rounded-xl px-3 py-2 text-xs mt-1"></label>
         <label class="block"><span class="text-[11px] font-bold text-zinc-600">账单检查间隔 (分钟)</span>
           <input id="s_billCheck" type="number" class="w-full bg-zinc-50 border border-zinc-200 rounded-xl px-3 py-2 text-xs mt-1"></label>
         <label class="flex items-center gap-2 mt-5"><input id="s_keepAlive" type="checkbox" class="w-4 h-4"><span class="text-[11px] font-bold text-zinc-600">默认开启保活</span></label>
@@ -1764,52 +2107,89 @@ function renderHtml() {
         <label class="block"><span class="text-[11px] font-bold text-zinc-600">启动重试窗口 (秒)</span>
           <input id="s_startRetry" type="number" class="w-full bg-zinc-50 border border-zinc-200 rounded-xl px-3 py-2 text-xs mt-1"></label>
         <label class="flex items-center gap-2"><input id="s_dailyReport" type="checkbox" class="w-4 h-4"><span class="text-[11px] font-bold text-zinc-600">每日日报</span></label>
-        <label class="block"><span class="text-[11px] font-bold text-zinc-600">日报时间 (HH:mm)</span>
-          <input id="s_dailyTime" type="text" class="w-full bg-zinc-50 border border-zinc-200 rounded-xl px-3 py-2 text-xs mt-1"></label>
-      </div>
-
-      <h3 class="text-[11px] font-bold uppercase tracking-wider text-zinc-400 pt-2">实例</h3>
-      <div id="acctEditor" class="space-y-3"></div>
-      <button onclick="addAccount()" class="px-3 py-1.5 rounded-xl bg-zinc-100 border border-zinc-200 text-zinc-700 text-[11px] font-bold">+ 添加实例</button>
-
-      <h3 class="text-[11px] font-bold uppercase tracking-wider text-zinc-400 pt-2">Cloudflare DDNS</h3>
-      <div class="grid md:grid-cols-2 gap-3">
-        <label class="block"><span class="text-[11px] font-bold text-zinc-600">API Token</span>
-          <input id="s_cfToken" type="text" class="w-full bg-zinc-50 border border-zinc-200 rounded-xl px-3 py-2 text-xs mt-1"></label>
-        <label class="block"><span class="text-[11px] font-bold text-zinc-600">Zone ID</span>
-          <input id="s_cfZone" type="text" class="w-full bg-zinc-50 border border-zinc-200 rounded-xl px-3 py-2 text-xs mt-1"></label>
-        <label class="block"><span class="text-[11px] font-bold text-zinc-600">Record ID</span>
-          <input id="s_cfRecord" type="text" class="w-full bg-zinc-50 border border-zinc-200 rounded-xl px-3 py-2 text-xs mt-1"></label>
-        <label class="block"><span class="text-[11px] font-bold text-zinc-600">域名</span>
-          <input id="s_cfDomain" type="text" class="w-full bg-zinc-50 border border-zinc-200 rounded-xl px-3 py-2 text-xs mt-1"></label>
+        <label class="block"><span class="text-[11px] font-bold text-zinc-600">日报时间</span>
+          <div class="grid grid-cols-2 gap-1 mt-1">
+            <select id="s_dailyTime_h" class="w-full bg-zinc-50 border border-zinc-200 rounded-xl px-2 py-2 text-xs font-bold"></select>
+            <select id="s_dailyTime_m" class="w-full bg-zinc-50 border border-zinc-200 rounded-xl px-2 py-2 text-xs font-bold"></select>
+          </div>
+        </label>
       </div>
 
       <h3 class="text-[11px] font-bold uppercase tracking-wider text-zinc-400 pt-2">通知</h3>
       <div class="grid md:grid-cols-3 gap-3">
-        <label class="flex items-center gap-2 mt-5"><input id="s_tgEnabled" type="checkbox" class="w-4 h-4"><span class="text-[11px] font-bold text-zinc-600">Telegram</span></label>
+        <label class="flex items-center gap-2 mt-5"><input id="s_tgEnabled" type="checkbox" class="w-4 h-4"><span class="text-[11px] font-bold text-zinc-600">Telegram 告警</span></label>
         <label class="block"><span class="text-[11px] font-bold text-zinc-600">Bot Token</span>
-          <input id="s_tgToken" type="text" class="w-full bg-zinc-50 border border-zinc-200 rounded-xl px-3 py-2 text-xs mt-1"></label>
+          <input id="s_tgToken" type="text" class="w-full bg-zinc-50 border border-zinc-200 rounded-xl px-3 py-2 text-xs mt-1 font-mono"></label>
         <label class="block"><span class="text-[11px] font-bold text-zinc-600">Chat ID</span>
-          <input id="s_tgChat" type="text" class="w-full bg-zinc-50 border border-zinc-200 rounded-xl px-3 py-2 text-xs mt-1"></label>
+          <input id="s_tgChat" type="text" class="w-full bg-zinc-50 border border-zinc-200 rounded-xl px-3 py-2 text-xs mt-1 font-mono"></label>
       </div>
 
       <h3 class="text-[11px] font-bold uppercase tracking-wider text-zinc-400 pt-2">安全</h3>
       <label class="block"><span class="text-[11px] font-bold text-zinc-600">管理员密码</span>
-        <input id="s_adminPass" type="password" class="w-full bg-zinc-50 border border-zinc-200 rounded-xl px-3 py-2 text-xs mt-1"></label>
+        <input id="s_adminPass" type="password" placeholder="未修改则留空" class="w-full bg-zinc-50 border border-zinc-200 rounded-xl px-3 py-2 text-xs mt-1"></label>
       <p id="adminPassHint" class="text-[10px] text-zinc-400"></p>
 
       <h3 class="text-[11px] font-bold uppercase tracking-wider text-zinc-400 pt-2">诊断</h3>
       <div class="flex gap-2 flex-wrap">
-        <button onclick="act('test_tg')" class="px-3 py-1.5 rounded-xl bg-zinc-100 border border-zinc-200 text-zinc-700 text-[11px] font-bold">发送测试消息</button>
-        <button onclick="probeBill()" class="px-3 py-1.5 rounded-xl bg-zinc-100 border border-zinc-200 text-zinc-700 text-[11px] font-bold">账单接口诊断</button>
-        <button onclick="act('clear_logs')" class="px-3 py-1.5 rounded-xl bg-zinc-100 border border-zinc-200 text-zinc-700 text-[11px] font-bold">清空日志</button>
+        <button onclick="act('test_tg')" class="px-3 py-1.5 rounded-xl bg-zinc-100 hover:bg-zinc-200 border border-zinc-200 text-zinc-700 text-[11px] font-bold">发送测试消息</button>
+        <button onclick="probeBill()" class="px-3 py-1.5 rounded-xl bg-zinc-100 hover:bg-zinc-200 border border-zinc-200 text-zinc-700 text-[11px] font-bold">账单接口诊断</button>
+        <button onclick="act('clear_logs')" class="px-3 py-1.5 rounded-xl bg-zinc-100 hover:bg-zinc-200 border border-zinc-200 text-zinc-700 text-[11px] font-bold">清空日志</button>
       </div>
       <pre id="probeOut" class="hidden max-h-72 overflow-auto text-[10px] bg-zinc-50 border border-zinc-200 rounded-xl p-3 whitespace-pre-wrap break-all"></pre>
     </div>
 
-    <div class="flex justify-end gap-2 pt-2">
-      <button onclick="closeSettings()" class="px-4 py-2 rounded-xl bg-zinc-100 text-zinc-700 text-xs font-bold">取消</button>
-      <button onclick="saveSettings()" class="px-4 py-2 rounded-xl bg-zinc-900 text-white text-xs font-bold">保存</button>
+    <div class="flex justify-end gap-2 pt-2 border-t border-zinc-100">
+      <button onclick="closeGlobalSettings()" class="px-4 py-2 rounded-xl bg-zinc-100 text-zinc-700 text-xs font-bold">取消</button>
+      <button onclick="saveGlobalSettings()" class="px-4 py-2 rounded-xl bg-zinc-900 text-white text-xs font-bold">保存全局设置</button>
+    </div>
+  </div>
+</div>
+
+<!-- ============================================================================ -->
+<!-- 弹窗 2: 分组管理与各组 DDNS 设置 -->
+<!-- ============================================================================ -->
+<div id="groupModal" class="hidden fixed inset-0 bg-black/40 backdrop-blur-sm p-4 overflow-auto z-50 flex items-start justify-center">
+  <div class="card-static rounded-3xl w-full max-w-3xl my-8 p-6 space-y-5 shadow-2xl">
+    <div class="flex justify-between items-center border-b border-zinc-100 pb-3">
+      <div>
+        <h2 class="text-sm font-bold text-zinc-900">分组管理与 Cloudflare DDNS</h2>
+        <p class="text-[11px] text-zinc-400">配置分组名称、独立 DDNS 域名及轮换周期 (0=不轮换)</p>
+      </div>
+      <button onclick="closeGroupModal()" class="text-zinc-400 hover:text-zinc-600 text-2xl leading-none">&times;</button>
+    </div>
+
+    <div class="flex justify-between items-center">
+      <span class="text-xs font-bold text-zinc-700">分组列表</span>
+      <button onclick="addNewGroup()" class="px-3 py-1.5 rounded-xl bg-zinc-900 hover:bg-zinc-800 text-white text-[11px] font-bold transition-colors">
+        + 新增分组
+      </button>
+    </div>
+
+    <div id="groupEditList" class="space-y-4"></div>
+
+    <div class="flex justify-end gap-2 pt-3 border-t border-zinc-100">
+      <button onclick="closeGroupModal()" class="px-4 py-2 rounded-xl bg-white border border-zinc-200 text-zinc-700 text-xs font-bold">关闭</button>
+      <button onclick="saveGroups()" class="px-4 py-2 rounded-xl bg-zinc-900 text-white text-xs font-bold">保存分组设置</button>
+    </div>
+  </div>
+</div>
+
+<!-- ============================================================================ -->
+<!-- 弹窗 3: 单个实例独立设置弹窗 -->
+<!-- ============================================================================ -->
+<div id="instanceModal" class="hidden fixed inset-0 bg-black/40 backdrop-blur-sm p-4 overflow-auto z-50 flex items-start justify-center">
+  <div class="card-static rounded-3xl w-full max-w-xl my-8 p-6 space-y-4 shadow-2xl">
+    <div class="flex justify-between items-center border-b border-zinc-100 pb-3">
+      <h2 id="instModalTitle" class="text-sm font-bold text-zinc-900">实例设置</h2>
+      <button onclick="closeInstanceSettings()" class="text-zinc-400 hover:text-zinc-600 text-2xl leading-none">&times;</button>
+    </div>
+    <div id="instModalBody" class="space-y-3"></div>
+    <div class="flex justify-between items-center pt-2 border-t border-zinc-100">
+      <button id="btnDeleteInst" onclick="deleteCurrentInstance()" class="text-rose-600 hover:text-rose-700 text-xs font-bold">删除此实例</button>
+      <div class="flex gap-2">
+        <button onclick="closeInstanceSettings()" class="px-4 py-2 rounded-xl bg-zinc-100 text-zinc-700 text-xs font-bold">取消</button>
+        <button onclick="saveInstanceSettings()" class="px-4 py-2 rounded-xl bg-zinc-900 text-white text-xs font-bold">保存实例配置</button>
+      </div>
     </div>
   </div>
 </div>
@@ -1817,8 +2197,9 @@ function renderHtml() {
 <script>
 let CFG = null;
 let STATE = null;
+let CURRENT_EDIT_ACC_ID = null;
+let draggedInstId = null;
 
-// 每个故障码对应的“怎么解”提示，避免用户卡在保护状态里无路可走
 const FAULT_HINTS = {
   INSTANCE_NOT_FOUND: '实例已被释放或实例 ID 不正确。请到「设置」删除该实例或改成正确的实例 ID，然后点下面的按钮。',
   ACCOUNT_NOT_CONFIGURED: '实例缺少 AK/SK/地域/实例 ID。请到「设置」补全后重试。',
@@ -1834,14 +2215,6 @@ const FAULT_HINTS = {
   TRANSITION_TIMEOUT: '换班超时未收敛。确认两台实例状态后重试。',
   TARGET_NOT_RUNNING_AFTER_DNS: 'DNS 切换后目标实例又停了。请检查该实例。',
 };
-
-// 实例编辑器是从 CFG.accounts 渲染的，但用户输入只存在 DOM 里。
-// 任何重新渲染（添加 / 删除）之前必须先把 DOM 收回 CFG，否则刚填的内容会丢。
-function syncAccountsFromDom(){
-  const rows = document.querySelectorAll('#acctEditor [data-idx]');
-  if (!rows.length) return;
-  CFG.accounts = collectAccounts();
-}
 
 function esc(s){ return String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
 
@@ -1911,75 +2284,145 @@ function barColor(p){
 }
 
 function statusStyle(s){
-  if (s === 'Running') return 'bg-emerald-100 text-emerald-700';
-  if (s === 'Stopped') return 'bg-zinc-100 text-zinc-600';
-  if (s === 'Stopping' || s === 'Starting') return 'bg-amber-100 text-amber-700';
-  return 'bg-rose-100 text-rose-700';
+  if (s === 'Running') return 'bg-emerald-100 text-emerald-800 border border-emerald-300';
+  if (s === 'Stopped') return 'bg-zinc-100 text-zinc-700 border border-zinc-300';
+  return 'bg-amber-100 text-amber-800 border border-amber-300';
 }
 
 function renderAccounts(){
-  const grid = document.getElementById('accountGrid');
+  const container = document.getElementById('groupSections') || document.getElementById('accountGrid');
   const list = STATE.accounts || [];
   document.getElementById('emptyHint').classList.toggle('hidden', list.length > 0);
-  grid.innerHTML = list.map(function(a){
-    // 进度条以免费限额（如非中国内地 200GB）为分母，阈值（如 188GB）单独显示并在条上打标记
-    const qp = barPct(a.trafficGb, a.quota);
-    const thresholdMark = (a.threshold > 0 && a.quota > 0 && a.threshold < a.quota)
-      ? barPct(a.threshold, a.quota) : null;
-    const bp = barPct(a.billAccountAmount, a.billThreshold);
-    const cls = a.trafficClass === 'china' ? '中国内地' : '非中国内地';
-    const cur = a.billCurrency || '';
-    const status = a.ecsStatus || '未知';
-    const brk = (a.breakdown || []).map(function(b){ return esc(b.region) + ' ' + b.gb + 'GB'; }).join(' · ');
 
-    const row = function(label, value){
-      return '<div class="flex justify-between text-[11px]"><span class="text-zinc-500">' + label + '</span>'
-        + '<span class="font-bold text-zinc-800">' + value + '</span></div>';
-    };
+  const groups = (CFG && CFG.groups && CFG.groups.length > 0) ? CFG.groups : [{ id:'group-default', name:'默认分组', rotationIntervalMinutes:0, cf:{ enabled:false } }];
+  
+  container.innerHTML = groups.map(function(group){
+    const groupInsts = list.filter(function(a){ return (a.groupId || 'group-default') === group.id; });
+    const hasDdns = group.cf && group.cf.enabled && group.cf.domainName;
+    const hasRotation = group.rotationIntervalMinutes > 0;
+    
+    let badge = '';
+    let hint = '';
+    if (!hasDdns && !hasRotation) {
+      badge = '<span class="px-2.5 py-1 rounded-full text-[11px] font-bold bg-zinc-100 text-zinc-700 border border-zinc-300">未配置 DDNS · 实例保持不变</span>';
+      hint = '未配置 Cloudflare DDNS 与定时轮换。组内实例各自保持状态，不执行自动换班。';
+    } else {
+      badge = '<span class="px-2.5 py-1 rounded-full text-[11px] font-bold bg-emerald-100 text-emerald-800 border border-emerald-300 flex items-center gap-1.5">'
+        + '<span class="w-2 h-2 rounded-full bg-emerald-500 animate-pulse"></span>'
+        + '定时轮换: ' + group.rotationIntervalMinutes + ' 分钟'
+        + ' · DDNS: ' + esc(group.cf.domainName || '未填域名')
+        + '</span>';
+      hint = '组内实例按设定定时轮换，换班后自动更新专属 DDNS 解析。';
+    }
 
-    return '<div class="card rounded-2xl p-4 space-y-2.5">'
-      + '<div class="flex justify-between items-start gap-2">'
-      +   '<div><p class="text-sm font-bold text-zinc-900">' + esc(a.name) + '</p>'
-      +   '<p class="text-[10px] text-zinc-400">' + esc(a.regionId) + ' · ' + cls + ' · 额度 ' + a.quota + 'GB</p></div>'
-      +   '<div class="flex gap-1 flex-wrap justify-end">'
-      +     (a.duty ? '<span class="px-2 py-0.5 rounded-full text-[10px] font-bold bg-emerald-100 text-emerald-700">当班</span>' : '')
-      +     (a.exhausted ? '<span class="px-2 py-0.5 rounded-full text-[10px] font-bold bg-rose-100 text-rose-700">耗尽</span>' : '')
-      +     '<span class="px-2 py-0.5 rounded-full text-[10px] font-bold ' + statusStyle(status) + '">' + esc(status) + '</span>'
+    return '<div class="space-y-3">'
+      + '<div class="card-static rounded-2xl p-4 bg-white border border-zinc-300 shadow-sm">'
+      +   '<div class="flex flex-wrap items-center justify-between gap-3">'
+      +     '<div class="flex items-center gap-3">'
+      +       '<span class="text-xl">📁</span>'
+      +       '<div>'
+      +         '<div class="flex items-center gap-2">'
+      +           '<h2 class="text-sm font-bold text-zinc-900">' + esc(group.name) + '</h2>'
+      +           '<span class="text-[10px] text-zinc-400 font-mono">(' + esc(group.id) + ')</span>'
+      +         '</div>'
+      +         '<p class="text-[11px] text-zinc-500 mt-0.5">' + hint + '</p>'
+      +       '</div>'
+      +     '</div>'
+      +     '<div class="flex items-center gap-2">'
+      +       badge
+      +       '<button onclick="openGroupSettings()" class="px-2.5 py-1 rounded-lg bg-zinc-50 hover:bg-zinc-100 border border-zinc-300 text-zinc-700 text-[10px] font-bold transition-colors">配置该组 DDNS</button>'
+      +     '</div>'
       +   '</div>'
       + '</div>'
-      + (!a.configured ? '<p class="text-[10px] text-amber-600 font-bold">未配置完整（缺 AK/SK/地域/实例 ID）</p>' : '')
-      + (a.ecsError ? '<p class="text-[10px] text-rose-600">' + esc(a.ecsError) + '</p>' : '')
-      + '<div>'
-      +   '<div class="flex justify-between text-[11px] mb-1"><span class="text-zinc-500">流量</span><span class="font-bold text-zinc-800">' + (a.trafficGb ?? '-') + ' / ' + a.quota + ' GB（限额）</span></div>'
-      +   '<div class="relative h-1.5 rounded-full bg-zinc-100 overflow-hidden"><div class="h-full ' + barColor(qp) + '" style="width:' + qp + '%"></div>'
-      +     (thresholdMark != null ? '<div class="absolute top-0 h-full w-0.5 bg-zinc-700/60" style="left:' + thresholdMark + '%"></div>' : '')
-      +   '</div>'
-      +   '<div class="flex justify-between text-[10px] mt-1"><span class="text-zinc-400">阈值</span><span class="' + (a.exhausted ? 'text-rose-600 font-bold' : 'text-zinc-500') + '">' + a.threshold + ' GB</span></div>'
+      + '<div id="dropzone_' + esc(group.id) + '" data-group-id="' + esc(group.id) + '" ondragover="onDragOver(event)" ondragleave="onDragLeave(event)" ondrop="onDrop(event, this.dataset.groupId)" class="grid md:grid-cols-2 gap-4 p-2 rounded-2xl border-2 border-dashed border-zinc-300 bg-zinc-200/50 transition-colors min-h-[140px]">'
+      +   (groupInsts.length > 0 ? groupInsts.map(renderCardHtml).join('') : (
+          '<div class="md:col-span-2 py-8 text-center text-xs text-zinc-500 pointer-events-none flex flex-col items-center justify-center gap-1.5 bg-white/60 rounded-xl border border-zinc-200">'
+          + '<span class="text-base">📥 空分组</span>'
+          + '<span class="text-[11px] text-zinc-500">按住上方其他实例卡片的 [⋮⋮ 拖拽] 手柄，拖到此区域即可迁入</span>'
+          + '</div>'
+      ))
       + '</div>'
-      + (a.billThreshold > 0
-          ? '<div>'
-            + '<div class="flex justify-between text-[11px] mb-1"><span class="text-zinc-500">账单（账号级）</span><span class="font-bold text-zinc-800">' + money(a.billAccountAmount, cur) + ' / ' + money(a.billThreshold, cur) + '</span></div>'
-            + '<div class="h-1.5 rounded-full bg-zinc-100 overflow-hidden"><div class="h-full ' + barColor(bp) + '" style="width:' + bp + '%"></div></div>'
-            + '</div>'
-          : row('账单（账号级）', money(a.billAccountAmount, cur)))
-      + row('该实例费用', money(a.billInstanceAmount, cur))
-      + row('账户余额', a.balanceOk ? money(a.balance, a.balanceCurrency || cur) : (a.configured ? '查询失败' : '-'))
-      + row('公网 IP', a.ecsEip
-          ? esc(a.ecsEip)
-          : (a.eip ? esc(a.eip) + ' <span class="text-[10px] text-zinc-400 font-normal">（配置）</span>' : '-'))
-      + (a.eip && a.ecsEip && a.eip !== a.ecsEip
-          ? '<p class="text-[10px] text-rose-600">⚠️ 与配置的 EIP 不一致：' + esc(a.eip) + '</p>'
-          : '')
-      + (a.ecsStatus === 'Stopped'
-          ? row('停机模式', a.ecsStoppedMode === 'StopCharging'
-              ? '<span class="text-emerald-700">节省停机</span>'
-              : '<span class="text-rose-600">' + esc(a.ecsStoppedMode || '未知') + '，仍在计费</span>')
-          : '')
-      + row('保活', a.keepAlive ? '开启' : '关闭')
-      + (a.reason ? '<p class="text-[10px] text-rose-600">' + esc(a.reason) + '</p>' : '')
-      + (brk ? '<p class="text-[10px] text-zinc-400">' + brk + '</p>' : '')
       + '</div>';
   }).join('');
+  const ag = document.getElementById('accountGrid');
+  if (ag && ag !== container) ag.innerHTML = container.innerHTML;
+}
+
+function renderCardHtml(a){
+  const qp = barPct(a.trafficGb, a.quota);
+  const thresholdMark = (a.threshold > 0 && a.quota > 0 && a.threshold < a.quota) ? barPct(a.threshold, a.quota) : null;
+  const bp = barPct(a.billAccountAmount, a.billThreshold);
+  const cls = a.trafficClass === 'china' ? '中国内地' : '非中国内地';
+  const cur = a.billCurrency || '';
+  const status = a.ecsStatus || '未知';
+  const brk = (a.breakdown || []).map(function(b){ return esc(b.region) + ' ' + b.gb + 'GB'; }).join(' · ');
+
+  const row = function(label, value){
+    return '<div class="flex justify-between text-[11px]"><span class="text-zinc-500">' + label + '</span>'
+      + '<span class="font-bold text-zinc-800">' + value + '</span></div>';
+  };
+
+  const isRunning = status === 'Running';
+  const isStopped = status === 'Stopped';
+  const isBusy = status === 'Starting' || status === 'Stopping';
+
+  const actionButtons = '<div class="flex items-center gap-1.5 pt-1 border-t border-zinc-200">'
+    + (isStopped
+        ? '<button onclick="controlInstance(&#39;start_instance&#39;,&#39;' + esc(a.id) + '&#39;,&#39;' + esc(a.name) + '&#39;)" class="flex-1 py-1 rounded-lg bg-emerald-50 hover:bg-emerald-100 border border-emerald-300 text-emerald-800 text-[11px] font-bold transition-colors">▶ 启动</button>'
+        : (isRunning
+            ? '<button onclick="controlInstance(&#39;stop_instance&#39;,&#39;' + esc(a.id) + '&#39;,&#39;' + esc(a.name) + '&#39;)" class="flex-1 py-1 rounded-lg bg-rose-50 hover:bg-rose-100 border border-rose-300 text-rose-800 text-[11px] font-bold transition-colors">⏹ 节省停机</button>'
+            : '<button disabled class="flex-1 py-1 rounded-lg bg-zinc-100 border border-zinc-200 text-zinc-400 text-[11px] font-bold cursor-not-allowed">' + (isBusy ? '处理中…' : '无法控制') + '</button>'
+          ))
+    + '<button onclick="openAccountSettings(&#39;' + esc(a.id) + '&#39;)" class="px-2.5 py-1 rounded-lg bg-white hover:bg-zinc-100 border border-zinc-300 text-zinc-700 text-[11px] font-bold transition-colors shadow-sm">⚙️ 设置</button>'
+    + '</div>';
+
+  return '<div id="card_' + esc(a.id) + '" class="inst-card rounded-2xl p-4 space-y-2.5">'
+    + '<div class="flex justify-between items-start gap-2">'
+    +   '<div class="flex items-center gap-2">'
+    +     '<div draggable="true" data-inst-id="' + esc(a.id) + '" ondragstart="onDragStart(event, this.dataset.instId)" ondragend="onDragEnd(event)" class="drag-handle px-1.5 py-0.5 rounded bg-zinc-100 hover:bg-indigo-100 hover:text-indigo-700 text-zinc-500 border border-zinc-300 text-[10px] font-bold select-none shrink-0" title="按住鼠标拖拽此手柄可移动分组">⋮⋮ 拖拽</div>'
+    +     '<div><p class="text-sm font-bold text-zinc-900">' + esc(a.name) + '</p>'
+    +     '<p class="text-[10px] text-zinc-400">' + esc(a.regionId) + ' · ' + cls + ' · 额度 ' + a.quota + 'GB</p></div>'
+    +   '</div>'
+    +   '<div class="flex gap-1 flex-wrap justify-end">'
+    +     (a.duty ? '<span class="px-2 py-0.5 rounded-full text-[10px] font-bold bg-emerald-100 text-emerald-800 border border-emerald-300">当班</span>' : '')
+    +     (a.exhausted ? '<span class="px-2 py-0.5 rounded-full text-[10px] font-bold bg-rose-100 text-rose-700 border border-rose-300">耗尽</span>' : '')
+    +     '<span class="px-2 py-0.5 rounded-full text-[10px] font-bold ' + statusStyle(status) + '">' + esc(status) + '</span>'
+    +   '</div>'
+    + '</div>'
+    + (!a.configured ? '<p class="text-[10px] text-amber-600 font-bold">未配置完整（缺 AK/SK/地域/实例 ID）</p>' : '')
+    + (a.ecsError ? '<p class="text-[10px] text-rose-600">' + esc(a.ecsError) + '</p>' : '')
+    + '<div>'
+    +   '<div class="flex justify-between text-[11px] mb-1"><span class="text-zinc-500">流量</span><span class="font-bold text-zinc-800">' + (a.trafficGb ?? '-') + ' / ' + a.quota + ' GB（限额）</span></div>'
+    +   '<div class="relative h-1.5 rounded-full bg-zinc-200 overflow-hidden"><div class="h-full ' + barColor(qp) + '" style="width:' + qp + '%"></div>'
+    +     (thresholdMark != null ? '<div class="absolute top-0 h-full w-0.5 bg-zinc-800" style="left:' + thresholdMark + '%"></div>' : '')
+    +   '</div>'
+    +   '<div class="flex justify-between text-[10px] mt-1"><span class="text-zinc-400">阈值</span><span class="' + (a.exhausted ? 'text-rose-600 font-bold' : 'text-zinc-500') + '">' + a.threshold + ' GB</span></div>'
+    + '</div>'
+    + (a.billThreshold > 0
+        ? '<div>'
+          + '<div class="flex justify-between text-[11px] mb-1"><span class="text-zinc-500">账单（账号级）</span><span class="font-bold text-zinc-800">' + money(a.billAccountAmount, cur) + ' / ' + money(a.billThreshold, cur) + '</span></div>'
+          + '<div class="h-1.5 rounded-full bg-zinc-200 overflow-hidden"><div class="h-full ' + barColor(bp) + '" style="width:' + bp + '%"></div></div>'
+          + '</div>'
+        : row('账单（账号级）', money(a.billAccountAmount, cur)))
+    + row('该实例费用', money(a.billInstanceAmount, cur))
+    + row('账户余额', a.balanceOk ? money(a.balance, a.balanceCurrency || cur) : (a.configured ? '查询失败' : '-'))
+    + row('公网 IP', a.ecsEip
+        ? esc(a.ecsEip)
+        : (a.eip ? esc(a.eip) + ' <span class="text-[10px] text-zinc-400 font-normal">（配置）</span>' : '-'))
+    + (a.eip && a.ecsEip && a.eip !== a.ecsEip
+        ? '<p class="text-[10px] text-rose-600">⚠️ 与配置的 EIP 不一致：' + esc(a.eip) + '</p>'
+        : '')
+    + (a.ecsStatus === 'Stopped'
+        ? row('停机模式', a.ecsStoppedMode === 'StopCharging'
+            ? '<span class="text-emerald-700">节省停机</span>'
+            : '<span class="text-rose-600">' + esc(a.ecsStoppedMode || '未知') + '，仍在计费</span>')
+        : '')
+    + row('保活', a.keepAlive ? '开启' : '关闭')
+    + (a.scheduleEnabled ? row('运行时段', '<span class="text-indigo-700 font-bold">⏰ ' + esc(a.startTime) + ' ~ ' + esc(a.stopTime) + '</span>') : '')
+    + (a.reason ? '<p class="text-[10px] text-rose-600">' + esc(a.reason) + '</p>' : '')
+    + (brk ? '<p class="text-[10px] text-zinc-400">' + brk + '</p>' : '')
+    + actionButtons
+    + '</div>';
 }
 
 function renderLogs(){
@@ -2016,142 +2459,464 @@ async function refresh(){
   renderStatus(); renderAccounts(); renderLogs();
 }
 
-function openSettings(){ fillSettings(); document.getElementById('settingsModal').classList.remove('hidden'); }
-function closeSettings(){ document.getElementById('settingsModal').classList.add('hidden'); }
+// 拖拽逻辑
+function onDragStart(e, instId) {
+  draggedInstId = instId;
+  e.dataTransfer.setData('text/plain', instId);
+  e.dataTransfer.effectAllowed = 'move';
+  const card = document.getElementById('card_' + instId);
+  if (card) card.classList.add('dragging');
+}
 
-function fillSettings(){
+function onDragEnd(e) {
+  if (draggedInstId) {
+    const card = document.getElementById('card_' + draggedInstId);
+    if (card) card.classList.remove('dragging');
+  }
+  document.querySelectorAll('[id^="dropzone_"]').forEach(el => el.classList.remove('drag-over'));
+  draggedInstId = null;
+}
+
+function onDragOver(e) {
+  e.preventDefault();
+  e.dataTransfer.dropEffect = 'move';
+  e.currentTarget.classList.add('drag-over');
+}
+
+function onDragLeave(e) {
+  e.currentTarget.classList.remove('drag-over');
+}
+
+async function onDrop(e, targetGroupId) {
+  e.preventDefault();
+  e.currentTarget.classList.remove('drag-over');
+  const instId = e.dataTransfer.getData('text/plain') || draggedInstId;
+  if (!instId) return;
+
+  const inst = (CFG.accounts || []).find(i => i.id === instId);
+  if (!inst || inst.groupId === targetGroupId) return;
+
+  inst.groupId = targetGroupId;
+  try {
+    await api('/api/config', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ...CFG, accounts: CFG.accounts })
+    });
+    await refresh();
+  } catch(err) {
+    alert('移动分组失败: ' + err.message);
+  }
+}
+
+// 弹窗 1: 全局设置
+function openGlobalSettings(){
   const s = CFG.system;
   document.getElementById('s_trafficChina').value = s.trafficThresholdChina;
   document.getElementById('s_trafficIntl').value = s.trafficThresholdIntl;
   document.getElementById('s_billThreshold').value = s.billThreshold;
-  document.getElementById('s_rotation').value = s.rotationIntervalMinutes;
   document.getElementById('s_billCheck').value = s.billCheckMinutes;
   document.getElementById('s_keepAlive').checked = s.keepAlive;
   document.getElementById('s_drain').value = s.dnsDrainSeconds;
   document.getElementById('s_timeout').value = s.transitionTimeoutMinutes;
   document.getElementById('s_startRetry').value = s.startRetrySeconds;
   document.getElementById('s_dailyReport').checked = s.dailyReport;
-  document.getElementById('s_dailyTime').value = s.dailyReportTime;
-  document.getElementById('s_cfToken').value = CFG.cf.apiToken;
-  document.getElementById('s_cfZone').value = CFG.cf.zoneId;
-  document.getElementById('s_cfRecord').value = CFG.cf.recordId;
-  document.getElementById('s_cfDomain').value = CFG.cf.domainName;
+  const [dh, dm] = parseHHMM(s.dailyReportTime || '23:58', '23', '58');
+  const dthEl = document.getElementById('s_dailyTime_h');
+  const dtmEl = document.getElementById('s_dailyTime_m');
+  if (dthEl) dthEl.innerHTML = hourOptions(dh);
+  if (dtmEl) dtmEl.innerHTML = minuteOptions(dm);
   document.getElementById('s_tgEnabled').checked = CFG.notify.tg.enabled;
   document.getElementById('s_tgToken').value = CFG.notify.tg.botToken;
   document.getElementById('s_tgChat').value = CFG.notify.tg.chatId;
-  document.getElementById('s_adminPass').value = CFG.adminPass;
+  document.getElementById('s_adminPass').value = '';
   document.getElementById('adminPassHint').textContent = CFG.adminPassFromSecret
     ? '已通过 ADMIN_PASS secret 设置，此处留空即可。'
     : '未使用 Secret，密码保存在 KV 中。建议改用 ADMIN_PASS secret。';
-  renderAccountEditor();
+  document.getElementById('settingsModal').classList.remove('hidden');
 }
 
-function accountRow(a, i){
-  const regions = ${JSON.stringify(REGIONS)}.map(function(r){
-    return '<option value="' + r[0] + '"' + (a.regionId === r[0] ? ' selected' : '') + '>' + r[0] + ' · ' + r[1] + '</option>';
-  }).join('');
-  const sel = function(v){ return v === true ? ' selected' : ''; };
-  return '<div class="rounded-2xl border border-zinc-200 p-3 space-y-2" data-idx="' + i + '">'
-    + '<div class="flex justify-between items-center">'
-    +   '<span class="text-[11px] font-bold text-zinc-700">实例 #' + (i+1) + '</span>'
-    +   '<button onclick="removeAccount(' + i + ')" class="text-[10px] text-rose-600 font-bold">删除</button>'
-    + '</div>'
-    + '<div class="grid md:grid-cols-2 gap-2">'
-    +   '<input data-f="name" value="' + esc(a.name) + '" placeholder="名称" class="bg-zinc-50 border border-zinc-200 rounded-lg px-2 py-1.5 text-[11px]">'
-    +   '<input data-f="instanceId" value="' + esc(a.instanceId) + '" placeholder="ECS 实例 ID" class="bg-zinc-50 border border-zinc-200 rounded-lg px-2 py-1.5 text-[11px]">'
-    +   '<input data-f="ak" value="' + esc(a.ak) + '" placeholder="AccessKey ID" class="bg-zinc-50 border border-zinc-200 rounded-lg px-2 py-1.5 text-[11px]">'
-    +   '<input data-f="sk" value="' + esc(a.sk) + '" placeholder="AccessKey Secret" class="bg-zinc-50 border border-zinc-200 rounded-lg px-2 py-1.5 text-[11px]">'
-    +   '<select data-f="regionId" class="bg-zinc-50 border border-zinc-200 rounded-lg px-2 py-1.5 text-[11px]">' + regions + '</select>'
-    +   '<select data-f="siteType" class="bg-zinc-50 border border-zinc-200 rounded-lg px-2 py-1.5 text-[11px]">'
-    +     '<option value="international"' + sel(a.siteType === 'international') + '>国际站 (business.ap-southeast-1)</option>'
-    +     '<option value="china"' + sel(a.siteType === 'china') + '>中国站 (business.cn-hangzhou)</option>'
-    +   '</select>'
-    +   '<input data-f="eip" value="' + esc(a.eip) + '" placeholder="备用 EIP（可留空）" class="bg-zinc-50 border border-zinc-200 rounded-lg px-2 py-1.5 text-[11px]">'
-    +   (a.liveEip ? '<p class="text-[10px] text-zinc-400 md:col-span-2">当前实例公网 IP：' + esc(a.liveEip) + '</p>' : '')
-    +   '<input data-f="remark" value="' + esc(a.remark) + '" placeholder="备注" class="bg-zinc-50 border border-zinc-200 rounded-lg px-2 py-1.5 text-[11px]">'
-    +   '<input data-f="trafficThresholdGb" value="' + esc(a.trafficThresholdGb ?? '') + '" placeholder="流量阈值覆盖（留空=跟随全局）" class="bg-zinc-50 border border-zinc-200 rounded-lg px-2 py-1.5 text-[11px]">'
-    +   '<input data-f="billThreshold" value="' + esc(a.billThreshold ?? '') + '" placeholder="账单阈值覆盖（留空=跟随全局）" class="bg-zinc-50 border border-zinc-200 rounded-lg px-2 py-1.5 text-[11px]">'
-    +   '<select data-f="keepAlive" class="bg-zinc-50 border border-zinc-200 rounded-lg px-2 py-1.5 text-[11px]">'
-    +     '<option value=""' + (a.keepAlive == null ? ' selected' : '') + '>保活：跟随全局</option>'
-    +     '<option value="true"' + sel(a.keepAlive === true) + '>保活：强制开启</option>'
-    +     '<option value="false"' + sel(a.keepAlive === false) + '>保活：强制关闭</option>'
-    +   '</select>'
-    +   '<div class="flex items-center gap-2">'
-    +     '<label class="flex items-center gap-1"><input type="checkbox" data-f="scheduleEnabled"' + (a.scheduleEnabled ? ' checked' : '') + ' class="w-3.5 h-3.5"><span class="text-[10px] text-zinc-600">限定运行时段</span></label>'
-    +     '<input data-f="startTime" value="' + esc(a.startTime) + '" class="w-16 bg-zinc-50 border border-zinc-200 rounded-lg px-2 py-1.5 text-[11px]">'
-    +     '<input data-f="stopTime" value="' + esc(a.stopTime) + '" class="w-16 bg-zinc-50 border border-zinc-200 rounded-lg px-2 py-1.5 text-[11px]">'
-    +   '</div>'
-    + '</div>'
-    + '<input type="hidden" data-f="id" value="' + esc(a.id || '') + '">'
-    + '</div>';
+function closeGlobalSettings(){
+  document.getElementById('settingsModal').classList.add('hidden');
 }
 
-function renderAccountEditor(){
-  document.getElementById('acctEditor').innerHTML = (CFG.accounts || []).map(accountRow).join('');
-}
-
-function addAccount(){
-  syncAccountsFromDom();
-  CFG.accounts.push({
-    id: '', name: '实例 ' + ((CFG.accounts.length||0)+1), ak:'', sk:'', regionId:'ap-southeast-1',
-    instanceId:'', eip:'', siteType:'international', trafficThresholdGb:null, billThreshold:null,
-    keepAlive:null, scheduleEnabled:false, startTime:'00:00', stopTime:'23:59', remark:''
-  });
-  if (document.getElementById('settingsModal').classList.contains('hidden')) openSettings();
-  renderAccountEditor();
-}
-
-function removeAccount(i){
-  syncAccountsFromDom();
-  CFG.accounts.splice(i, 1);
-  renderAccountEditor();
-}
-
-function collectAccounts(){
-  const rows = document.querySelectorAll('#acctEditor [data-idx]');
-  const out = [];
-  rows.forEach(function(row){
-    const acc = {};
-    row.querySelectorAll('[data-f]').forEach(function(el){
-      const f = el.getAttribute('data-f');
-      if (el.type === 'checkbox') acc[f] = el.checked;
-      else acc[f] = el.value;
-    });
-    acc.trafficThresholdGb = acc.trafficThresholdGb === '' ? null : Number(acc.trafficThresholdGb);
-    acc.billThreshold = acc.billThreshold === '' ? null : Number(acc.billThreshold);
-    acc.keepAlive = acc.keepAlive === '' ? null : acc.keepAlive === 'true';
-    acc.scheduleEnabled = !!acc.scheduleEnabled;
-    out.push(acc);
-  });
-  return out;
-}
-
-async function saveSettings(){
+async function saveGlobalSettings(){
   const v = function(id){ return document.getElementById(id).value; };
   const c = function(id){ return document.getElementById(id).checked; };
   const payload = {
+    ...CFG,
     system: {
+      ...CFG.system,
       trafficThresholdChina: Number(v('s_trafficChina')),
       trafficThresholdIntl: Number(v('s_trafficIntl')),
       billThreshold: Number(v('s_billThreshold')),
-      rotationIntervalMinutes: Number(v('s_rotation')),
       billCheckMinutes: Number(v('s_billCheck')),
       keepAlive: c('s_keepAlive'),
       dnsDrainSeconds: Number(v('s_drain')),
       transitionTimeoutMinutes: Number(v('s_timeout')),
       startRetrySeconds: Number(v('s_startRetry')),
       dailyReport: c('s_dailyReport'),
-      dailyReportTime: v('s_dailyTime'),
+      dailyReportTime: (v('s_dailyTime_h') || '23') + ':' + (v('s_dailyTime_m') || '58'),
     },
-    accounts: collectAccounts(),
-    cf: { apiToken: v('s_cfToken'), zoneId: v('s_cfZone'), recordId: v('s_cfRecord'), domainName: v('s_cfDomain') },
     notify: { tg: { enabled: c('s_tgEnabled'), botToken: v('s_tgToken'), chatId: v('s_tgChat') } },
     adminPass: v('s_adminPass'),
   };
   try {
     await api('/api/config', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(payload) });
-    closeSettings(); await refresh();
+    closeGlobalSettings();
+    await refresh();
   } catch(e){ alert('保存失败: ' + e.message); }
+}
+
+// 弹窗 2: 分组管理
+function openGroupSettings(){
+  renderGroupEditList();
+  document.getElementById('groupModal').classList.remove('hidden');
+}
+
+function closeGroupModal(){
+  document.getElementById('groupModal').classList.add('hidden');
+}
+
+function renderGroupEditList(){
+  const container = document.getElementById('groupEditList');
+  const groups = CFG.groups || [];
+  const accounts = CFG.accounts || [];
+
+  container.innerHTML = groups.map(function(g, idx){
+    const isDefault = g.id === 'group-default' || idx === 0;
+    const groupAccounts = accounts.filter(function(a){ return (a.groupId || 'group-default') === g.id; });
+    
+    // 解析轮换数值与单位（换算为天/小时/分钟）
+    const totalMinutes = Number(g.rotationIntervalMinutes) || 0;
+    let unit = 'm';
+    let val = 0;
+    if (totalMinutes > 0) {
+      if (totalMinutes % 1440 === 0) { unit = 'd'; val = totalMinutes / 1440; }
+      else if (totalMinutes % 60 === 0) { unit = 'h'; val = totalMinutes / 60; }
+      else { unit = 'm'; val = totalMinutes; }
+    }
+
+    const primaryOpts = '<option value="">未指定（自动选组内第 1 台可用实例）</option>'
+      + groupAccounts.map(function(a){
+          return '<option value="' + esc(a.id) + '"' + (g.primaryAccountId === a.id ? ' selected' : '') + '>' + esc(a.name) + ' (' + esc(a.regionId) + ')</option>';
+        }).join('');
+
+    return '<div class="card-static rounded-2xl p-4 border border-zinc-200 space-y-3">'
+      + '<div class="flex justify-between items-center">'
+      +   '<span class="text-xs font-bold text-zinc-800">分组 #' + (idx + 1) + ': ' + esc(g.name) + '</span>'
+      +   (!isDefault ? '<button data-gid="' + esc(g.id) + '" onclick="deleteGroup(this.dataset.gid)" class="text-[11px] text-rose-600 font-bold">删除</button>' : '<span class="text-[10px] text-zinc-400">默认组</span>')
+      + '</div>'
+      + '<div class="grid grid-cols-2 gap-2">'
+      +   '<label class="block"><span class="text-[10px] font-bold text-zinc-500">分组名称</span>'
+      +     '<input id="g_name_' + esc(g.id) + '" value="' + esc(g.name) + '" class="w-full bg-zinc-50 border border-zinc-200 rounded-lg px-2.5 py-1.5 text-xs mt-0.5"></label>'
+      +   '<label class="block"><span class="text-[10px] font-bold text-zinc-500">定时轮换 (0=不轮换)</span>'
+      +     '<div class="flex gap-1.5 mt-0.5">'
+      +       '<input type="number" id="g_rot_val_' + esc(g.id) + '" value="' + val + '" min="0" placeholder="0" class="w-2/3 bg-zinc-50 border border-zinc-200 rounded-lg px-2.5 py-1.5 text-xs">'
+      +       '<select id="g_rot_unit_' + esc(g.id) + '" class="w-1/3 bg-zinc-50 border border-zinc-200 rounded-lg px-1.5 py-1.5 text-xs font-bold">'
+      +         '<option value="m"' + (unit === 'm' ? ' selected' : '') + '>分钟</option>'
+      +         '<option value="h"' + (unit === 'h' ? ' selected' : '') + '>小时</option>'
+      +         '<option value="d"' + (unit === 'd' ? ' selected' : '') + '>天</option>'
+      +       '</select>'
+      +     '</div>'
+      +   '</label>'
+      + '</div>'
+      + '<div class="rounded-xl bg-zinc-50 p-3 space-y-2 border border-zinc-200">'
+      +   '<label class="flex items-center gap-2">'
+      +     '<input type="checkbox" id="g_cf_en_' + esc(g.id) + '"' + (g.cf && g.cf.enabled ? ' checked' : '') + ' data-gid="' + esc(g.id) + '" onchange="toggleCf(this.dataset.gid)" class="w-4 h-4">'
+      +     '<span class="text-xs font-bold text-zinc-700">启用 Cloudflare DDNS</span>'
+      +   '</label>'
+      +   '<div id="cf_box_' + esc(g.id) + '" class="space-y-2 ' + (g.cf && g.cf.enabled ? '' : 'opacity-40 pointer-events-none') + '">'
+      +     '<div class="grid grid-cols-2 gap-2">'
+      +       '<input id="g_cf_tok_' + esc(g.id) + '" value="' + esc(g.cf?.apiToken || '') + '" placeholder="API Token" class="bg-white border border-zinc-200 rounded-lg px-2 py-1 text-xs">'
+      +       '<input id="g_cf_zone_' + esc(g.id) + '" value="' + esc(g.cf?.zoneId || '') + '" placeholder="Zone ID" class="bg-white border border-zinc-200 rounded-lg px-2 py-1 text-xs">'
+      +       '<input id="g_cf_rec_' + esc(g.id) + '" value="' + esc(g.cf?.recordId || '') + '" placeholder="Record ID" class="bg-white border border-zinc-200 rounded-lg px-2 py-1 text-xs">'
+      +       '<input id="g_cf_dom_' + esc(g.id) + '" value="' + esc(g.cf?.domainName || '') + '" placeholder="解析域名 (如 hk.example.com)" class="bg-white border border-zinc-200 rounded-lg px-2 py-1 text-xs">'
+      +     '</div>'
+      +     '<label class="block pt-1 border-t border-zinc-200/60"><span class="text-[10px] font-bold text-zinc-500">主解析实例（未开启轮换时固定解析此实例；耗尽时自动顺移备用机）</span>'
+      +       '<select id="g_primary_' + esc(g.id) + '" class="w-full bg-white border border-zinc-200 rounded-lg px-2 py-1 text-xs mt-0.5">' + primaryOpts + '</select>'
+      +     '</label>'
+      +   '</div>'
+      + '</div>'
+      + '</div>';
+  }).join('');
+}
+
+function toggleCf(gid){
+  const en = document.getElementById('g_cf_en_' + gid).checked;
+  const box = document.getElementById('cf_box_' + gid);
+  if (en) box.classList.remove('opacity-40', 'pointer-events-none');
+  else box.classList.add('opacity-40', 'pointer-events-none');
+}
+
+function addNewGroup(){
+  const id = 'group-' + Date.now().toString().slice(-4);
+  CFG.groups = CFG.groups || [];
+  CFG.groups.push({
+    id: id,
+    name: '新建分组 ' + (CFG.groups.length + 1),
+    rotationIntervalMinutes: 60,
+    primaryAccountId: '',
+    cf: { enabled: false, apiToken: '', zoneId: '', recordId: '', domainName: '' }
+  });
+  renderGroupEditList();
+}
+
+function deleteGroup(gid){
+  if (!confirm('确认删除该分组？组内实例将自动归入默认分组。')) return;
+  (CFG.accounts || []).forEach(function(a){ if (a.groupId === gid) a.groupId = 'group-default'; });
+  CFG.groups = (CFG.groups || []).filter(function(g){ return g.id !== gid; });
+  renderGroupEditList();
+}
+
+async function saveGroups(){
+  (CFG.groups || []).forEach(function(g){
+    const n = document.getElementById('g_name_' + g.id);
+    const rVal = document.getElementById('g_rot_val_' + g.id);
+    const rUnit = document.getElementById('g_rot_unit_' + g.id);
+    const pAcc = document.getElementById('g_primary_' + g.id);
+    const en = document.getElementById('g_cf_en_' + g.id);
+
+    if (n) g.name = n.value;
+    if (rVal && rUnit) {
+      const v = Math.max(0, parseInt(rVal.value, 10) || 0);
+      const mult = rUnit.value === 'd' ? 1440 : rUnit.value === 'h' ? 60 : 1;
+      g.rotationIntervalMinutes = v * mult;
+    }
+    if (pAcc) g.primaryAccountId = pAcc.value || '';
+    if (en) {
+      g.cf = g.cf || {};
+      g.cf.enabled = en.checked;
+      g.cf.apiToken = document.getElementById('g_cf_tok_' + g.id)?.value || '';
+      g.cf.zoneId = document.getElementById('g_cf_zone_' + g.id)?.value || '';
+      g.cf.recordId = document.getElementById('g_cf_rec_' + g.id)?.value || '';
+      g.cf.domainName = document.getElementById('g_cf_dom_' + g.id)?.value || '';
+    }
+  });
+
+  try {
+    await api('/api/config', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ...CFG, groups: CFG.groups, accounts: CFG.accounts })
+    });
+    closeGroupModal();
+    await refresh();
+  } catch(e) {
+    alert('保存分组失败: ' + e.message);
+  }
+}
+
+// 弹窗 3: 单个实例独立设置
+function openAccountSettings(accId){
+  const acc = (CFG.accounts || []).find(a => a.id === accId);
+  if (!acc) return alert('未找到该实例配置');
+  CURRENT_EDIT_ACC_ID = accId;
+  document.getElementById('instModalTitle').textContent = '设置实例 - ' + (acc.name || '实例');
+  document.getElementById('instModalBody').innerHTML = accountRow(acc);
+  document.getElementById('btnDeleteInst').classList.remove('hidden');
+  document.getElementById('instanceModal').classList.remove('hidden');
+}
+
+function closeInstanceSettings(){
+  CURRENT_EDIT_ACC_ID = null;
+  document.getElementById('instanceModal').classList.add('hidden');
+}
+
+function addAccount(){
+  CURRENT_EDIT_ACC_ID = 'acc-' + Date.now().toString().slice(-4);
+  const defaultGid = CFG.groups?.[0]?.id || 'group-default';
+  const newInst = {
+    id: CURRENT_EDIT_ACC_ID,
+    groupId: defaultGid,
+    name: '实例 ' + ((CFG.accounts?.length || 0) + 1),
+    ak: '', sk: '', regionId: 'ap-southeast-1', instanceId: '', eip: '',
+    siteType: 'international', trafficThresholdGb: null, billThreshold: null,
+    keepAlive: null, scheduleEnabled: false, startTime: '00:00', stopTime: '23:59', remark: ''
+  };
+  CFG.accounts = CFG.accounts || [];
+  CFG.accounts.push(newInst);
+  document.getElementById('instModalTitle').textContent = '新建实例';
+  document.getElementById('instModalBody').innerHTML = accountRow(newInst);
+  document.getElementById('btnDeleteInst').classList.add('hidden');
+  document.getElementById('instanceModal').classList.remove('hidden');
+}
+
+function deleteCurrentInstance(){
+  if (!CURRENT_EDIT_ACC_ID) return;
+  if (!confirm('确定要删除此实例吗？')) return;
+  CFG.accounts = (CFG.accounts || []).filter(a => a.id !== CURRENT_EDIT_ACC_ID);
+  closeInstanceSettings();
+  api('/api/config', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ ...CFG, accounts: CFG.accounts })
+  }).then(refresh);
+}
+
+async function saveInstanceSettings(){
+  if (!CURRENT_EDIT_ACC_ID) return closeInstanceSettings();
+  const row = document.querySelector('#instModalBody [data-acc-form]');
+  if (!row) return closeInstanceSettings();
+
+  const acc = {};
+  row.querySelectorAll('[data-f]').forEach(function(el){
+    const f = el.getAttribute('data-f');
+    if (el.type === 'checkbox') acc[f] = el.checked;
+    else acc[f] = el.value;
+  });
+  acc.trafficThresholdGb = acc.trafficThresholdGb === '' ? null : Number(acc.trafficThresholdGb);
+  acc.billThreshold = acc.billThreshold === '' ? null : Number(acc.billThreshold);
+  acc.keepAlive = acc.keepAlive === '' ? null : acc.keepAlive === 'true';
+  acc.scheduleEnabled = !!acc.scheduleEnabled;
+  const startH = document.getElementById('inst_start_h')?.value || '00';
+  const startM = document.getElementById('inst_start_m')?.value || '00';
+  const stopH = document.getElementById('inst_stop_h')?.value || '23';
+  const stopM = document.getElementById('inst_stop_m')?.value || '59';
+  acc.startTime = startH + ':' + startM;
+  acc.stopTime = stopH + ':' + stopM;
+  acc.id = CURRENT_EDIT_ACC_ID;
+
+  const idx = CFG.accounts.findIndex(a => a.id === CURRENT_EDIT_ACC_ID);
+  if (idx !== -1) CFG.accounts[idx] = acc;
+
+  try {
+    await api('/api/config', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ...CFG, accounts: CFG.accounts })
+    });
+    closeInstanceSettings();
+    await refresh();
+  } catch(e) {
+    alert('保存失败: ' + e.message);
+  }
+}
+
+async function controlInstance(action, accountId, name){
+  const isStop = action === 'stop_instance';
+  const label = isStop ? '节省停机' : '启动';
+  if (!confirm('确定要对实例【' + name + '】执行【' + label + '】操作吗？')) return;
+  try {
+    const r = await api('/api/action', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ action: action, accountId: accountId })
+    });
+    if (r && r.error) alert(label + '失败: ' + r.error);
+    else alert('已成功发送' + label + '指令');
+    await refresh();
+  } catch(e) {
+    alert(label + '请求出错: ' + e.message);
+  }
+}
+
+function hourOptions(selH){
+  let hNum = parseInt(selH, 10);
+  if (isNaN(hNum)) hNum = 0;
+  const opts = [];
+  for (let h = 0; h < 24; h++) {
+    const s = String(h).padStart(2, '0');
+    opts.push('<option value="' + s + '"' + (h === hNum ? ' selected' : '') + '>' + s + ' 时</option>');
+  }
+  return opts.join('');
+}
+
+function minuteOptions(selM){
+  let mNum = parseInt(selM, 10);
+  if (isNaN(mNum)) mNum = 0;
+  // 常用分钟刻度（00, 15, 30, 45, 59）
+  const mins = [0, 15, 30, 45, 59];
+  if (!mins.includes(mNum)) mins.push(mNum);
+  mins.sort((a,b) => a - b);
+  return mins.map(function(m){
+    const s = String(m).padStart(2, '0');
+    return '<option value="' + s + '"' + (m === mNum ? ' selected' : '') + '>' + s + ' 分</option>';
+  }).join('');
+}
+
+function parseHHMM(val, defH, defM){
+  const parts = String(val || '').split(':');
+  const h = parts[0] != null && parts[0] !== '' ? parts[0].padStart(2, '0') : defH;
+  const m = parts[1] != null && parts[1] !== '' ? parts[1].padStart(2, '0') : defM;
+  return [h, m];
+}
+
+function timeColPicker(prefix, curVal, defH, defM){
+  const [h, m] = parseHHMM(curVal, defH, defM);
+  return '<div class="grid grid-cols-2 gap-1 mt-0.5">'
+    + '<select id="' + prefix + '_h" class="w-full bg-white border border-zinc-200 rounded-lg px-2 py-1.5 text-xs font-bold">' + hourOptions(h) + '</select>'
+    + '<select id="' + prefix + '_m" class="w-full bg-white border border-zinc-200 rounded-lg px-2 py-1.5 text-xs font-bold">' + minuteOptions(m) + '</select>'
+    + '</div>';
+}
+
+function accountRow(a){
+  const regions = ${JSON.stringify(REGIONS)}.map(function(r){
+    return '<option value="' + r[0] + '"' + (a.regionId === r[0] ? ' selected' : '') + '>' + r[0] + ' · ' + r[1] + '</option>';
+  }).join('');
+  const groups = (CFG?.groups || [{ id:'group-default', name:'默认分组' }]).map(function(g){
+    return '<option value="' + esc(g.id) + '"' + ((a.groupId || 'group-default') === g.id ? ' selected' : '') + '>' + esc(g.name) + '</option>';
+  }).join('');
+  const sel = function(v){ return v === true ? ' selected' : ''; };
+
+  return '<div data-acc-form="true" class="space-y-3">'
+    + '<div class="grid md:grid-cols-2 gap-3">'
+    +   '<label class="block"><span class="text-[11px] font-bold text-zinc-600">实例名称</span>'
+    +     '<input data-f="name" value="' + esc(a.name) + '" placeholder="名称" class="w-full bg-zinc-50 border border-zinc-200 rounded-xl px-3 py-2 text-xs mt-1"></label>'
+    +   '<label class="block"><span class="text-[11px] font-bold text-zinc-600">归属分组</span>'
+    +     '<select data-f="groupId" class="w-full bg-zinc-50 border border-zinc-200 rounded-xl px-3 py-2 text-xs mt-1 font-bold">' + groups + '</select></label>'
+    + '</div>'
+    + '<div class="grid md:grid-cols-2 gap-3">'
+    +   '<label class="block"><span class="text-[11px] font-bold text-zinc-600">ECS 实例 ID</span>'
+    +     '<input data-f="instanceId" value="' + esc(a.instanceId) + '" placeholder="ECS 实例 ID" class="w-full bg-zinc-50 border border-zinc-200 rounded-xl px-3 py-2 text-xs mt-1 font-mono"></label>'
+    +   '<label class="block"><span class="text-[11px] font-bold text-zinc-600">地域</span>'
+    +     '<select data-f="regionId" class="w-full bg-zinc-50 border border-zinc-200 rounded-xl px-3 py-2 text-xs mt-1">' + regions + '</select></label>'
+    + '</div>'
+    + '<div class="grid md:grid-cols-2 gap-3">'
+    +   '<label class="block"><span class="text-[11px] font-bold text-zinc-600">AccessKey ID</span>'
+    +     '<input data-f="ak" value="' + esc(a.ak) + '" placeholder="AccessKey ID" class="w-full bg-zinc-50 border border-zinc-200 rounded-xl px-3 py-2 text-xs mt-1 font-mono"></label>'
+    +   '<label class="block"><span class="text-[11px] font-bold text-zinc-600">AccessKey Secret</span>'
+    +     '<input data-f="sk" value="' + esc(a.sk) + '" placeholder="AccessKey Secret" class="w-full bg-zinc-50 border border-zinc-200 rounded-xl px-3 py-2 text-xs mt-1 font-mono"></label>'
+    + '</div>'
+    + '<div class="grid md:grid-cols-2 gap-3">'
+    +   '<label class="block"><span class="text-[11px] font-bold text-zinc-600">站别类型</span>'
+    +     '<select data-f="siteType" class="w-full bg-zinc-50 border border-zinc-200 rounded-xl px-3 py-2 text-xs mt-1">'
+    +       '<option value="international"' + sel(a.siteType === 'international') + '>国际站 (business.ap-southeast-1)</option>'
+    +       '<option value="china"' + sel(a.siteType === 'china') + '>中国站 (business.cn-hangzhou)</option>'
+    +     '</select></label>'
+    +   '<label class="block"><span class="text-[11px] font-bold text-zinc-600">备用 EIP (可留空)</span>'
+    +     '<input data-f="eip" value="' + esc(a.eip) + '" placeholder="备用 EIP" class="w-full bg-zinc-50 border border-zinc-200 rounded-xl px-3 py-2 text-xs mt-1"></label>'
+    + '</div>'
+    + (a.liveEip ? '<p class="text-[10px] text-zinc-400">当前实例公网 IP：' + esc(a.liveEip) + '</p>' : '')
+    + '<div class="rounded-xl bg-zinc-50 border border-zinc-200 p-3 space-y-2">'
+    +   '<div class="flex items-center justify-between">'
+    +     '<label class="flex items-center gap-2 cursor-pointer">'
+    +       '<input type="checkbox" data-f="scheduleEnabled"' + (a.scheduleEnabled ? ' checked' : '') + ' class="w-4 h-4 rounded text-zinc-900">'
+    +       '<span class="text-xs font-bold text-zinc-800">限定每日运行时段</span>'
+    +     '</label>'
+    +     '<span class="text-[10px] text-zinc-400">不在此时段内保持关机节约成本</span>'
+    +   '</div>'
+    +   '<div class="grid grid-cols-2 gap-3">'
+    +     '<label class="block"><span class="text-[10px] font-bold text-zinc-500">每日开机时间</span>'
+    +       timeColPicker('inst_start', a.startTime, '00', '00') + '</label>'
+    +     '<label class="block"><span class="text-[10px] font-bold text-zinc-500">每日关机时间</span>'
+    +       timeColPicker('inst_stop', a.stopTime, '23', '59') + '</label>'
+    +   '</div>'
+    + '</div>'
+    + '<div class="grid grid-cols-3 gap-3">'
+    +   '<label class="block"><span class="text-[11px] font-bold text-zinc-600">流量阈值覆盖 (GB)</span>'
+    +     '<input data-f="trafficThresholdGb" value="' + esc(a.trafficThresholdGb ?? '') + '" placeholder="默认" class="w-full bg-zinc-50 border border-zinc-200 rounded-xl px-3 py-2 text-xs mt-1"></label>'
+    +   '<label class="block"><span class="text-[11px] font-bold text-zinc-600">账单阈值覆盖</span>'
+    +     '<input data-f="billThreshold" value="' + esc(a.billThreshold ?? '') + '" placeholder="默认" class="w-full bg-zinc-50 border border-zinc-200 rounded-xl px-3 py-2 text-xs mt-1"></label>'
+    +   '<label class="block"><span class="text-[11px] font-bold text-zinc-600">独立保活</span>'
+    +     '<select data-f="keepAlive" class="w-full bg-zinc-50 border border-zinc-200 rounded-xl px-3 py-2 text-xs mt-1">'
+    +       '<option value=""' + (a.keepAlive == null ? ' selected' : '') + '>跟随全局</option>'
+    +       '<option value="true"' + sel(a.keepAlive === true) + '>开启保活</option>'
+    +       '<option value="false"' + sel(a.keepAlive === false) + '>关闭保活</option>'
+    +     '</select></label>'
+    + '</div>'
+    + '<input type="hidden" data-f="remark" value="' + esc(a.remark) + '">'
+    + '</div>';
 }
 
 (async function init(){

@@ -175,10 +175,11 @@ npx wrangler deploy --dry-run
 
 ---
 
-## 6. 配置 Cloudflare DDNS（可选）
+## 6. 配置分组与 Cloudflare DDNS（可选）
 
-如果不需要域名跟随，跳过本节。
+如果不需要域名跟随或轮换，实例保留在「默认分组」即可。
 
+- [ ] 点击顶部导航「📁 分组与 DDNS」，可查看或新增自定义分组（如香港组、测试组）
 - [ ] 创建 API Token，权限：`Zone → DNS → Edit`，范围限定到目标 Zone
 - [ ] 拿到 **Zone ID**（域名概览页右侧）
 - [ ] 创建目标 **A 记录**，拿到 **Record ID**
@@ -189,6 +190,9 @@ curl -s -X GET "https://api.cloudflare.com/client/v4/zones/<ZONE_ID>/dns_records
   -H "Authorization: Bearer <API_TOKEN>" | grep -o '"id":"[^"]*"' | head -1
 ```
 
+- [ ] 在分组设置中填入 API Token、Zone ID、Record ID 与解析域名
+- [ ] **设置定时轮换周期**：支持按分钟、小时、天设置（如 `2 小时` 或 `1 天`；设为 0 表示不自动轮换）
+- [ ] **未开定时轮换时的 DDNS 解析**：若轮换周期设为 0，界面提供「主解析实例」下拉框，可显式指定该组由哪个实例承载 DDNS 域名解析
 - [ ] 把 A 记录的 **TTL 设小**（60 秒或 Auto），换班时生效更快
 - [ ] **不要开 Cloudflare 代理（橙云）**，否则解析到的是 Cloudflare 的 IP，DDNS 没有意义
 
@@ -198,20 +202,21 @@ curl -s -X GET "https://api.cloudflare.com/client/v4/zones/<ZONE_ID>/dns_records
 
 - [ ] 打开 Worker URL，看到登录页（**不是白屏**）
 - [ ] 用 `ADMIN_PASS` 登录成功
-- [ ] 顶部显示「等待首次巡检」
+- [ ] 顶部操作栏显示完整：`+ 添加实例`、`📁 分组与 DDNS`、`⚙️ 全局设置`、`立即巡检`
 - [ ] 显示「还没有实例。点「+ 添加实例」开始。」
 
 > **白屏** = 客户端脚本报错。开浏览器控制台看 `SyntaxError`。
 
 ---
 
-## 8. 添加第一个实例
+## 8. 添加实例与分组管理
 
 点「+ 添加实例」，填：
 
 | 字段 | 填什么 |
 |---|---|
 | 名称 | 随便，比如 `实例 1` |
+| 归属分组 | 选择已有分组（默认分组、或自定义分组） |
 | ECS 实例 ID | `i-xxxxxxxxxxxxxxxxx` |
 | AccessKey ID / Secret | 第 5 步那个 RAM 用户的 AK/SK |
 | 地域 | **实例实际所在地域**（决定走哪个 CDT 免费池） |
@@ -219,8 +224,11 @@ curl -s -X GET "https://api.cloudflare.com/client/v4/zones/<ZONE_ID>/dns_records
 | 备用 EIP | 该实例绑定的 EIP（可留空） |
 | 流量阈值覆盖 | 留空 = 跟随全局 |
 | 账单阈值覆盖 | 留空 = 跟随全局 |
-| 保活 | 跟随全局 |
-| 限定运行时段 | 不用就留空 |
+| 保活 | 跟随全局 / 开启 / 关闭 |
+| 限定运行时段 | 支持小时（00~23）与分钟（00~59）双列下拉框精准选择每日开机与关机时段 |
+
+> ### 💡 实例跨组迁移提示
+> 保存实例后，看板上支持直接按住卡片左上角的 `⋮⋮ 拖拽` 手柄，将其拖放至其他分组的虚线区域完成跨组归属调整。
 
 > ### ⚠️ 地域决定额度，别选错
 >
