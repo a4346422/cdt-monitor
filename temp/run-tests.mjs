@@ -221,6 +221,8 @@ check('时段 08:00-23:00 外', inTimeRange('23:30', '08:00', '23:00') === false
 check('跨午夜 22:00-06:00 内(23:00)', inTimeRange('23:00', '22:00', '06:00') === true);
 check('跨午夜 22:00-06:00 内(02:00)', inTimeRange('02:00', '22:00', '06:00') === true);
 check('跨午夜 22:00-06:00 外(12:00)', inTimeRange('12:00', '22:00', '06:00') === false);
+check('未补零单数字时段 7:00-1:59 内(08:00)', inTimeRange('08:00', '7:00', '1:59') === true);
+check('未补零单数字时段 7:00-1:59 外(02:00)', inTimeRange('02:00', '7:00', '1:59') === false);
 
 {
   const cfg = baseConfig([]);
@@ -380,6 +382,28 @@ console.log('\n[6] 保活');
   const st2 = { ...defaultState(), month: cstMonth(), dutyAccountId: 'a', dutySince: Date.now() };
   await runEngineCron(env2, makeEngine(st2));
   check('保活关闭后不拉起', world.startCalls.length === 0, world.startCalls);
+
+  // 设定时段外：Running 实例自动触发节省停机
+  const bjH = Number(new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Shanghai', hour: '2-digit', hour12: false }).format(new Date()));
+  const offStart = String((bjH + 4) % 24).padStart(2, '0') + ':00';
+  const offStop = String((bjH + 5) % 24).padStart(2, '0') + ':00';
+  world.stopCalls = [];
+  world.startCalls = [];
+  world.ecs['i-a'].Status = 'Running';
+  world.ecs['i-a'].StoppedMode = 'Not-applicable';
+  const cfgSched = baseConfig([acc('a', { scheduleEnabled: true, startTime: offStart, stopTime: offStop }), acc('b')]);
+  const envSched = makeEnv(cfgSched);
+  const stSched = { ...defaultState(), month: cstMonth(), dutyAccountId: 'a', dutySince: Date.now() };
+  await runEngineCron(envSched, makeEngine(stSched));
+  check('时段外运行中当班实例自动节省停机', world.stopCalls.includes('i-a'), world.stopCalls);
+  check('时段外停机通知已发送', world.tg.some((t) => t.includes('定时休眠停机')), world.tg);
+
+  // 设定时段外：Stopped 实例不触发保活拉起
+  world.startCalls = [];
+  world.ecs['i-a'].Status = 'Stopped';
+  world.ecs['i-a'].StoppedMode = 'StopCharging';
+  await runEngineCron(envSched, makeEngine(stSched));
+  check('时段外停机实例不保活拉起', world.startCalls.length === 0, world.startCalls);
 }
 
 // ============================================================================
@@ -821,6 +845,15 @@ console.log('\n[19] 实例卡片真的把停机模式渲染出来');
   const same = card({ ecsStatus: 'Running', ecsStoppedMode: 'Not-applicable', ecsEip: '1.2.3.4', eip: '1.2.3.4' });
   check('EIP 一致时不告警', !same.includes('与配置的 EIP 不一致'), null);
 
+  const schedCard = card({ scheduleEnabled: true, startTime: '07:00', stopTime: '01:59' });
+  check('卡片渲染跨天时段含次日', schedCard.includes('07:00 ~ 次日 01:59'), schedCard);
+
+  const schedUnpadded = card({ scheduleEnabled: true, startTime: '7:00', stopTime: '1:59' });
+  check('卡片渲染未补零跨天时段含次日且补零', schedUnpadded.includes('07:00 ~ 次日 01:59'), schedUnpadded);
+
+  const schedDay = card({ scheduleEnabled: true, startTime: '08:00', stopTime: '23:00' });
+  check('卡片渲染当天内时段不含次日', schedDay.includes('08:00 ~ 23:00') && !schedDay.includes('次日'), schedDay);
+
   globalThis.document = savedDoc;
   globalThis.fetch = savedFetch;
 }
@@ -988,6 +1021,108 @@ console.log('\n[22] 动态切换主解析实例与分组防孤立兜底');
   };
   const sanitized = sanitizeConfig(dirtyBody, cfg, env);
   check('已被删除分组的实例自动回退到 defaultGid', sanitized.accounts[0].groupId === 'group-remain', sanitized.accounts[0].groupId);
+}
+
+// ============================================================================
+console.log('\n[23] 手动控制实例接口（/api/action）与 engine.mutate');
+{
+  resetWorld();
+  const accounts = [acc('a')];
+  seed(accounts, 'i-a');
+  const cfg = baseConfig(accounts);
+  const env = makeEnv(cfg);
+
+  // 1. engine.mutate 单元测试
+  const engine = M.getEngine(env);
+  await engine.mutate((st) => {
+    st.testField = 'mutated';
+    return st;
+  });
+  const loaded = await engine.loadState();
+  check('engine.mutate 正确更新并持久化状态', loaded.testField === 'mutated', loaded);
+
+  // 2. /api/action stop_instance 接口调用测试（此前缺少 mutate 抛 500）
+  await env.STATE_KV.put('session:test-token', JSON.stringify({ expiresAt: Date.now() + 100000 }));
+  const stopReq = new Request('https://worker.test/api/action', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Cookie: 'cdt_session=test-token',
+    },
+    body: JSON.stringify({ action: 'stop_instance', accountId: 'a' }),
+  });
+  const stopRes = await M.default.fetch(stopReq, env);
+  const stopBody = await stopRes.json();
+  check('手动停机接口返回 200 OK', stopRes.status === 200, { status: stopRes.status, body: stopBody });
+  check('手动停机操作成功 ok: true', stopBody.ok === true, stopBody);
+  check('调用了 stopEcs', world.stopCalls.includes('i-a'), world.stopCalls);
+
+  // 3. /api/action start_instance 接口调用测试
+  const startReq = new Request('https://worker.test/api/action', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Cookie: 'cdt_session=test-token',
+    },
+    body: JSON.stringify({ action: 'start_instance', accountId: 'a' }),
+  });
+  const startRes = await M.default.fetch(startReq, env);
+  const startBody = await startRes.json();
+  check('手动启动接口返回 200 OK', startRes.status === 200, { status: startRes.status, body: startBody });
+  check('手动启动操作成功 ok: true', startBody.ok === true, startBody);
+  check('调用了 startEcs', world.startCalls.includes('i-a'), world.startCalls);
+}
+
+// ============================================================================
+console.log('\n[24] 默认分组/未配置 DDNS 分组的实例定时启停与耗尽防护');
+{
+  resetWorld();
+  const bjH = Number(new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Shanghai', hour: '2-digit', hour12: false }).format(new Date()));
+  const offStart = String((bjH + 4) % 24).padStart(2, '0') + ':00';
+  const offStop = String((bjH + 5) % 24).padStart(2, '0') + ':00';
+  const onStart = String((bjH - 1 + 24) % 24).padStart(2, '0') + ':00';
+  const onStop = String((bjH + 2) % 24).padStart(2, '0') + ':00';
+
+  const accounts = [
+    acc('sched1', { scheduleEnabled: true, startTime: offStart, stopTime: offStop }), // 当前在休眠期
+    acc('sched2', { scheduleEnabled: true, startTime: onStart, stopTime: onStop }),   // 当前在运行期
+    acc('sched3', { scheduleEnabled: true, startTime: onStart, stopTime: onStop }),   // 当前在运行期但已超限
+    acc('normal', { scheduleEnabled: false }),                                        // 未开启时段
+  ];
+  // 默认分组，无 DDNS，无定时轮换
+  const cfg = baseConfig(accounts);
+  cfg.groups = [{ id: 'group-default', name: '默认分组', rotationIntervalMinutes: 0, cf: { enabled: false } }];
+
+  // 初始状态：sched1 正在运行，sched2 处于停机，sched3 处于停机且耗尽，normal 处于停机
+  seed(accounts, 'i-sched1');
+  world.ecs['i-sched2'] = { Status: 'Stopped', StoppedMode: 'StopCharging', eip: '10.0.0.2' };
+  world.ecs['i-sched3'] = { Status: 'Stopped', StoppedMode: 'StopCharging', eip: '10.0.0.3' };
+  world.ecs['i-normal'] = { Status: 'Stopped', StoppedMode: 'StopCharging', eip: '10.0.0.4' };
+  world.cdt['ak-sched3'] = [{ region: 'ap-southeast-1', gb: 195 }]; // sched3 超限耗尽
+
+  const env = makeEnv(cfg);
+  const st = { ...defaultState(), month: cstMonth() };
+  const eng = makeEngine(st);
+
+  world.stopCalls = [];
+  world.startCalls = [];
+  world.tg = [];
+
+  await runEngineCron(env, eng);
+
+  // 1. sched1 在休眠期且 Running → 自动执行节省停机
+  check('默认组实例在休眠期自动节省停机', world.stopCalls.includes('i-sched1'), world.stopCalls);
+  check('发送休眠停机通知', world.tg.some((t) => t.includes('定时休眠停机') && t.includes('账号 SCHED1')), world.tg);
+
+  // 2. sched2 在运行期且 Stopped且未超限 → 自动恢复开机
+  check('默认组实例在运行期自动启动拉起', world.startCalls.includes('i-sched2'), world.startCalls);
+  check('发送定时恢复开机通知', world.tg.some((t) => t.includes('定时恢复开机') && t.includes('账号 SCHED2')), world.tg);
+
+  // 3. sched3 在运行期但已耗尽 → 绝对不启动
+  check('默认组耗尽实例不自动启动', !world.startCalls.includes('i-sched3'), world.startCalls);
+
+  // 4. normal 未开启时段管理 → 保持原样不启动
+  check('未开启时段的实例保持原样未被启动', !world.startCalls.includes('i-normal'), world.startCalls);
 }
 
 console.log(`\n${pass} passed, ${fail} failed`);

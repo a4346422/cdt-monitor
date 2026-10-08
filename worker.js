@@ -136,6 +136,14 @@ function bjNow() {
 
 function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
 
+function normalizeHHMM(v, def = '00:00') {
+  if (!v || typeof v !== 'string') return def;
+  const parts = v.trim().split(':');
+  const h = String(parts[0] != null && parts[0] !== '' ? parts[0] : '0').padStart(2, '0');
+  const m = String(parts[1] != null && parts[1] !== '' ? parts[1] : '0').padStart(2, '0');
+  return `${h}:${m}`;
+}
+
 function num(value, fallback = 0) {
   const n = Number(value);
   return Number.isFinite(n) ? n : fallback;
@@ -711,8 +719,8 @@ function normalizeAccount(a, defaultGid = 'group-default', validGids = null) {
     billThreshold: a.billThreshold ?? null,
     keepAlive: a.keepAlive ?? null,
     scheduleEnabled: !!a.scheduleEnabled,
-    startTime: a.startTime || '00:00',
-    stopTime: a.stopTime || '23:59',
+    startTime: normalizeHHMM(a.startTime, '00:00'),
+    stopTime: normalizeHHMM(a.stopTime, '23:59'),
     remark: a.remark || '',
   };
 }
@@ -767,10 +775,13 @@ function resolveKeepAlive(acc, cfg) {
 
 function inTimeRange(hhmm, start, stop) {
   if (!start || !stop) return true;
-  if (start === stop) return true;
-  return start < stop
-    ? (hhmm >= start && hhmm < stop)
-    : (hhmm >= start || hhmm < stop);   // 跨午夜
+  const s = normalizeHHMM(start, '00:00');
+  const e = normalizeHHMM(stop, '23:59');
+  if (s === e) return true;
+  const cur = normalizeHHMM(hhmm, '00:00');
+  return s < e
+    ? (cur >= s && cur < e)
+    : (cur >= s || cur < e);   // 跨午夜
 }
 
 // 额度耗尽 = 流量到阈值 或 账单到阈值（阈值为 0 表示该条件关闭）
@@ -888,6 +899,46 @@ async function stopAndConfirm(acc) {
     desc: after,
     detail: after.ok ? `${after.status}/${after.stoppedMode}` : (after.error || '状态未知'),
   };
+}
+
+async function syncScheduledInstance(env, cfg, state, engine, acc, now) {
+  const st = state.accounts[acc.id] || {};
+  const isInside = inTimeRange(now.hhmm, acc.startTime, acc.stopTime);
+
+  if (!isInside) {
+    if (st.ecsStatus === 'Running') {
+      const stopRes = await stopAndConfirm(acc);
+      st.ecsStatus = stopRes.ok ? 'Stopped' : st.ecsStatus;
+      st.ecsStoppedMode = stopRes.ok ? 'StopCharging' : st.ecsStoppedMode;
+      await engine.saveState(state);
+      await appendLogSafe(env, 'AUDIT', '定时休眠停机', `${acc.name}（不在运行时段 ${acc.startTime}~${acc.stopTime}）: ${stopRes.detail}`);
+      await sendTelegram(env, cfg, '🌙 【实例定时休眠停机】', [
+        ['账号', acc.name],
+        ['实例', acc.instanceId],
+        ['设定时段', `${acc.startTime} ~ ${acc.stopTime}`],
+        ['停机状态', stopRes.detail],
+      ], '当前时间不在设定运行时段内，已执行节省停机。');
+    }
+    return;
+  }
+
+  // 处于运行时段内：若处于关机且未耗尽，自动恢复开机
+  if (st.ecsStatus === 'Stopped') {
+    if (st.exhausted) return;
+    const started = await startEcs(acc);
+    if (started.ok) {
+      st.ecsStatus = 'Running';
+      await engine.saveState(state);
+      await appendLogSafe(env, 'AUDIT', '定时恢复开机', `${acc.name}（已进入运行时段 ${acc.startTime}~${acc.stopTime}）`);
+      await sendTelegram(env, cfg, '☀️ 【实例定时恢复开机】', [
+        ['账号', acc.name],
+        ['实例', acc.instanceId],
+        ['设定时段', `${acc.startTime} ~ ${acc.stopTime}`],
+      ], '已进入设定运行时段，已自动启动实例。');
+    } else {
+      await appendLogSafe(env, 'ERROR', `定时恢复开机失败 [${acc.name}]`, started.error || '未知错误');
+    }
+  }
 }
 
 // ---------------------------------------------------------------- 主循环
@@ -1036,6 +1087,10 @@ async function runEngineCron(env, engine) {
       gSched.dutySince = 0;
       gSched.transition = null;
       gSched.startAttempt = null;
+      for (const acc of groupAccounts) {
+        if (!acc.scheduleEnabled || !isConfigured(acc)) continue;
+        await syncScheduledInstance(env, cfg, state, engine, acc, now);
+      }
       continue;
     }
 
@@ -1162,6 +1217,25 @@ async function keepAliveDuty(env, cfg, state, engine, duty, dutyState, now, grou
     return setFault(env, engine, state, 'ECS_DESCRIBE_FAILED', `${duty.name}: ${desc.error}`);
   }
 
+  // 保活开关 + 允许运行时段
+  if (duty.scheduleEnabled && !inTimeRange(now.hhmm, duty.startTime, duty.stopTime)) {
+    if (desc.status === 'Running') {
+      const stopRes = await stopAndConfirm(duty);
+      gSched.startAttempt = null;
+      await engine.saveState(state);
+      await appendLogSafe(env, 'AUDIT', '定时休眠停机', `${duty.name}（不在运行时段 ${duty.startTime}~${duty.stopTime}）: ${stopRes.detail}`);
+      await sendTelegram(env, cfg, '🌙 【实例定时休眠停机】', [
+        ['账号', duty.name],
+        ['实例', duty.instanceId],
+        ['设定时段', `${duty.startTime} ~ ${duty.stopTime}`],
+        ['停机状态', stopRes.detail],
+      ], '当前时间不在设定运行时段内，已执行节省停机。');
+      return { ok: true, duty: duty.id, status: 'Stopped', outsideWindow: true, stoppedForSchedule: true };
+    }
+    await engine.saveState(state);
+    return { ok: true, duty: duty.id, status: desc.status, outsideWindow: true };
+  }
+
   if (desc.status === 'Running') {
     gSched.startAttempt = null;
     state.keepAliveAt = now.iso;
@@ -1169,14 +1243,9 @@ async function keepAliveDuty(env, cfg, state, engine, duty, dutyState, now, grou
     return { ok: true, duty: duty.id, status: 'Running', trafficGb: dutyState?.trafficGb };
   }
 
-  // 保活开关 + 允许运行时段
   if (!resolveKeepAlive(duty, cfg)) {
     await engine.saveState(state);
     return { ok: true, duty: duty.id, status: desc.status, keepAlive: false };
-  }
-  if (duty.scheduleEnabled && !inTimeRange(now.hhmm, duty.startTime, duty.stopTime)) {
-    await engine.saveState(state);
-    return { ok: true, duty: duty.id, status: desc.status, outsideWindow: true };
   }
 
   // 启动，带重试窗口
@@ -1536,6 +1605,12 @@ function getEngine(env) {
       await env.STATE_KV.delete('state_v2');
       return defaultState();
     },
+    async mutate(fn) {
+      const state = await this.loadState();
+      const next = (await fn(state)) || state;
+      await this.saveState(next);
+      return next;
+    },
   };
 }
 
@@ -1737,8 +1812,8 @@ export default {
           balance: st.balance ?? null, balanceCurrency: st.balanceCurrency || null, balanceOk: !!st.balanceOk,
           configured: isConfigured(a),
           scheduleEnabled: !!a.scheduleEnabled,
-          startTime: a.startTime || '00:00',
-          stopTime: a.stopTime || '23:59',
+          startTime: normalizeHHMM(a.startTime, '00:00'),
+          stopTime: normalizeHHMM(a.stopTime, '23:59'),
         };
       });
       return json({
@@ -1809,6 +1884,7 @@ export default {
           const desc = await describeEcs(acc);
           if (desc.ok) {
             await engine.mutate((st) => {
+              st.accounts = st.accounts || {};
               const a = st.accounts[acc.id] || {};
               st.accounts[acc.id] = {
                 ...a,
@@ -1834,6 +1910,7 @@ export default {
           const desc = await describeEcs(acc);
           if (desc.ok) {
             await engine.mutate((st) => {
+              st.accounts = st.accounts || {};
               const a = st.accounts[acc.id] || {};
               st.accounts[acc.id] = {
                 ...a,
@@ -2418,7 +2495,7 @@ function renderCardHtml(a){
             : '<span class="text-rose-600">' + esc(a.ecsStoppedMode || '未知') + '，仍在计费</span>')
         : '')
     + row('保活', a.keepAlive ? '开启' : '关闭')
-    + (a.scheduleEnabled ? row('运行时段', '<span class="text-indigo-700 font-bold">⏰ ' + esc(a.startTime) + ' ~ ' + esc(a.stopTime) + '</span>') : '')
+    + (a.scheduleEnabled ? row('运行时段', '<span class="text-indigo-700 font-bold">⏰ ' + esc(formatScheduleWindow(a.startTime, a.stopTime)) + '</span>') : '')
     + (a.reason ? '<p class="text-[10px] text-rose-600">' + esc(a.reason) + '</p>' : '')
     + (brk ? '<p class="text-[10px] text-zinc-400">' + brk + '</p>' : '')
     + actionButtons
@@ -2842,6 +2919,16 @@ function parseHHMM(val, defH, defM){
   return [h, m];
 }
 
+function formatScheduleWindow(startTime, stopTime){
+  if (!startTime && !stopTime) return '';
+  const [sh, sm] = parseHHMM(startTime, '00', '00');
+  const [eh, em] = parseHHMM(stopTime, '23', '59');
+  const s = sh + ':' + sm;
+  const e = eh + ':' + em;
+  const isOvernight = s > e;
+  return s + ' ~ ' + (isOvernight ? '次日 ' : '') + e;
+}
+
 function timeColPicker(prefix, curVal, defH, defM){
   const [h, m] = parseHHMM(curVal, defH, defM);
   return '<div class="grid grid-cols-2 gap-1 mt-0.5">'
@@ -2937,4 +3024,5 @@ function accountRow(a){
   resolveTrafficThreshold, resolveBillThreshold, resolveKeepAlive, inTimeRange,
   evaluateExhausted, validateConfig, bssEndpoint, maybeDailyReport,
   probeBilling, listEips, sanitizeConfig, reconcileAndClearFault, renderHtml,
+  normalizeHHMM,
 };
