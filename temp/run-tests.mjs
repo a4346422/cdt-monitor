@@ -1125,5 +1125,205 @@ console.log('\n[24] 默认分组/未配置 DDNS 分组的实例定时启停与�
   check('未开启时段的实例保持原样未被启动', !world.startCalls.includes('i-normal'), world.startCalls);
 }
 
+// ============================================================================
+console.log('\n[25] 手动操作与定时运行时段（方案 A 边缘触发）及 DDNS 换班协同');
+{
+  resetWorld();
+  const accA = acc('rotA', { groupId: 'g-rot' });
+  const accB = acc('rotB', { groupId: 'g-rot' });
+  const accounts = [accA, accB];
+  seed(accounts, 'i-rotA');
+
+  const cfg = baseConfig(accounts);
+  cfg.groups = [
+    {
+      id: 'g-rot',
+      name: 'DDNS轮换组',
+      cf: { enabled: true, domainName: 'rot.test.com', apiToken: 'cf-rot-token', zoneId: 'zone-rot', recordId: 'rec-rot' },
+      rotationIntervalMinutes: 0,
+      primaryAccountId: 'rotA',
+    },
+  ];
+  const env = makeEnv(cfg);
+  await env.STATE_KV.put('session:test-token', JSON.stringify({ expiresAt: Date.now() + 100000 }));
+  const stInit = {
+    ...defaultState(),
+    month: cstMonth(),
+    dutyAccountId: 'rotA',
+    dutySince: Date.now(),
+    groups: {
+      'g-rot': {
+        dutyAccountId: 'rotA',
+        dutySince: Date.now(),
+        rotationIndex: 0,
+        transition: null,
+      },
+    },
+  };
+  const eng = M.getEngine(env);
+  await eng.saveState(stInit);
+
+  // 1. 手动启动备机 rotB → 触发平滑切班给 rotB
+  const startReq = new Request('https://worker.test/api/action', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Cookie: 'cdt_session=test-token' },
+    body: JSON.stringify({ action: 'start_instance', accountId: 'rotB' }),
+  });
+  const startRes = await M.default.fetch(startReq, env);
+  const startBody = await startRes.json();
+  check('手动启动备机触发切班返回 ok', startBody.ok === true && startBody.transition === true, startBody);
+
+  // 推进换班
+  let st = await eng.loadState();
+  let guard = 0;
+  while ((st.transition || st.groups?.['g-rot']?.transition) && guard++ < 12) {
+    await runEngineCron(env, eng);
+    st = await eng.loadState();
+  }
+  check('手动启动备机后成功当班', st.groups['g-rot'].dutyAccountId === 'rotB', st.groups['g-rot']);
+  check('原当班实例 rotA 已停机', world.stopCalls.includes('i-rotA'), world.stopCalls);
+  check('DNS 切到 rotB IP', world.dns.content === world.ecs['i-rotB'].eip, world.dns.content);
+
+  // 2. 手动停机当班机 rotB → 触发换班回备机 rotA
+  world.stopCalls = [];
+  world.startCalls = [];
+  const stopReq = new Request('https://worker.test/api/action', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Cookie: 'cdt_session=test-token' },
+    body: JSON.stringify({ action: 'stop_instance', accountId: 'rotB' }),
+  });
+  const stopRes = await M.default.fetch(stopReq, env);
+  const stopBody = await stopRes.json();
+  check('手动停机当班机触发换班返回 ok', stopBody.ok === true && stopBody.transition === true, stopBody);
+
+  st = await eng.loadState();
+  guard = 0;
+  while ((st.transition || st.groups?.['g-rot']?.transition) && guard++ < 12) {
+    await runEngineCron(env, eng);
+    st = await eng.loadState();
+  }
+  check('手动停机当班机后备机接替当班', st.groups['g-rot'].dutyAccountId === 'rotA', st.groups['g-rot']);
+  check('旧当班 rotB 已停机', world.stopCalls.includes('i-rotB'), world.stopCalls);
+
+  // 3. 无备机可用时，手动停机直接停机且清空当班标记，不被保活拉起
+  st = await eng.loadState();
+  st.accounts.rotB = { ...(st.accounts.rotB || {}), exhausted: true };
+  await eng.saveState(st);
+  world.stopCalls = [];
+  world.startCalls = [];
+  const stopSoloReq = new Request('https://worker.test/api/action', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Cookie: 'cdt_session=test-token' },
+    body: JSON.stringify({ action: 'stop_instance', accountId: 'rotA' }),
+  });
+  const stopSoloRes = await M.default.fetch(stopSoloReq, env);
+  const stopSoloBody = await stopSoloRes.json();
+  check('无备机时手动停机成功', stopSoloBody.ok === true && !stopSoloBody.transition, stopSoloBody);
+  st = await eng.loadState();
+  check('无备机停机后 dutyAccountId 已清空', st.groups['g-rot'].dutyAccountId === null, st.groups['g-rot']);
+
+  // 执行一次 Cron 巡检，验证保活不会拉起 rotA
+  await runEngineCron(env, eng);
+  check('无备机手动停机后保活不会拉起', !world.startCalls.includes('i-rotA'), world.startCalls);
+
+  // 4. 定时时段边缘触发测试（方案 A）
+  const bjH = Number(new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Shanghai', hour: '2-digit', hour12: false }).format(new Date()));
+  const offStart = String((bjH + 4) % 24).padStart(2, '0') + ':00';
+  const offStop = String((bjH + 5) % 24).padStart(2, '0') + ':00';
+  const onStart = String((bjH - 1 + 24) % 24).padStart(2, '0') + ':00';
+  const onStop = String((bjH + 2) % 24).padStart(2, '0') + ':00';
+
+  const accEdgeOff = acc('edgeOff', { groupId: 'g-def', scheduleEnabled: true, startTime: offStart, stopTime: offStop });
+  const accEdgeOn = acc('edgeOn', { groupId: 'g-def', scheduleEnabled: true, startTime: onStart, stopTime: onStop });
+  cfg.accounts.push(accEdgeOff, accEdgeOn);
+  cfg.groups.push({ id: 'g-def', name: '独立组' });
+  seed([accEdgeOff, accEdgeOn]);
+  world.ecs['i-edgeOff'] = { Status: 'Running', StoppedMode: 'KeepCharging', eip: '10.0.1.1' };
+  world.ecs['i-edgeOn'] = { Status: 'Stopped', StoppedMode: 'StopCharging', eip: '10.0.1.2' };
+
+  // edgeOff 在休眠时段，手动开机
+  const startEdgeReq = new Request('https://worker.test/api/action', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Cookie: 'cdt_session=test-token' },
+    body: JSON.stringify({ action: 'start_instance', accountId: 'edgeOff' }),
+  });
+  await M.default.fetch(startEdgeReq, env);
+
+  // edgeOn 在运行时段，手动关机
+  const stopEdgeReq = new Request('https://worker.test/api/action', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Cookie: 'cdt_session=test-token' },
+    body: JSON.stringify({ action: 'stop_instance', accountId: 'edgeOn' }),
+  });
+  await M.default.fetch(stopEdgeReq, env);
+
+  world.stopCalls = [];
+  world.startCalls = [];
+  await runEngineCron(env, eng);
+  check('休眠期手动开机在同时段内不被定时休眠逆转', !world.stopCalls.includes('i-edgeOff'), world.stopCalls);
+  check('运行期手动关机在同时段内不被定时开机逆转', !world.startCalls.includes('i-edgeOn'), world.startCalls);
+
+  // 5. 轮换为 0 且有 primaryAccountId 时：手动启动备机上位，后续 Cron 巡检不会被 primaryAccountId 强行抢回
+  {
+    resetWorld();
+    const pAcc = acc('priA', { groupId: 'g-pri' });
+    const sAcc = acc('secB', { groupId: 'g-pri' });
+    const accList = [pAcc, sAcc];
+    seed(accList, 'i-priA');
+
+    const priCfg = baseConfig(accList);
+    priCfg.groups = [
+      {
+        id: 'g-pri',
+        name: '指定主实例组',
+        rotationIntervalMinutes: 0,
+        primaryAccountId: 'priA',
+        cf: { enabled: true, domainName: 'pri.test.com', apiToken: 'cf-pri-token', zoneId: 'z-p', recordId: 'r-p' },
+      },
+    ];
+    const priEnv = makeEnv(priCfg);
+    const priEng = M.getEngine(priEnv);
+    await priEnv.STATE_KV.put('session:test-token', JSON.stringify({ expiresAt: Date.now() + 100000 }));
+    const priSt = {
+      ...defaultState(),
+      month: cstMonth(),
+      dutyAccountId: 'priA',
+      dutySince: Date.now(),
+      groups: {
+        'g-pri': {
+          dutyAccountId: 'priA',
+          dutySince: Date.now(),
+          rotationIndex: 0,
+          transition: null,
+        },
+      },
+    };
+    await priEng.saveState(priSt);
+
+    // 手动启动 secB 上位
+    const swReq = new Request('https://worker.test/api/action', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Cookie: 'cdt_session=test-token' },
+      body: JSON.stringify({ action: 'start_instance', accountId: 'secB' }),
+    });
+    const swRes = await M.default.fetch(swReq, priEnv);
+    const swBody = await swRes.json();
+    check('手动启动备机触发上位成功', swBody.ok && swBody.transition, swBody);
+
+    let curPriSt = await priEng.loadState();
+    let g = 0;
+    while ((curPriSt.transition || curPriSt.groups?.['g-pri']?.transition) && g++ < 12) {
+      await runEngineCron(priEnv, priEng);
+      curPriSt = await priEng.loadState();
+    }
+    check('换班完成后 secB 成功当班', curPriSt.groups['g-pri'].dutyAccountId === 'secB', curPriSt.groups['g-pri']);
+
+    // 关键验证：后续正常的定时巡检 Cron 触发，不会因为 primaryAccountId 是 priA 而把当班抢回去！
+    await runEngineCron(priEnv, priEng);
+    const afterCronSt = await priEng.loadState();
+    check('巡检不会将人工上位抢回 primaryAccountId', afterCronSt.groups['g-pri'].dutyAccountId === 'secB', afterCronSt.groups['g-pri']);
+  }
+}
+
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);

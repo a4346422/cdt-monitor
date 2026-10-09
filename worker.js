@@ -845,6 +845,27 @@ function findGroup(cfg, groupId) {
   return (cfg.groups || []).find((g) => g.id === groupId) || null;
 }
 
+function isGroupDdnsOrRotation(group) {
+  if (!group) return false;
+  const hasDdns = !!(group.cf && group.cf.enabled && group.cf.domainName && group.cf.apiToken);
+  const rotationMinutes = num(group.rotationIntervalMinutes, 0);
+  return hasDdns || rotationMinutes > 0;
+}
+
+// 统一检查并刷新/过期 manualOverride 标记（若跨越时段分界点或超24小时则自动清空）
+function refreshManualOverride(st, acc, now) {
+  if (!st || !st.manualOverride) return null;
+  const mo = st.manualOverride;
+  const isInside = inTimeRange(now.hhmm, acc.startTime, acc.stopTime);
+  const sameWindowPhase = (mo.inWindow === isInside);
+  const expired24h = mo.at && (Date.now() - mo.at > 24 * 3600 * 1000);
+  if (sameWindowPhase && !expired24h) {
+    return mo;
+  }
+  delete st.manualOverride;
+  return null;
+}
+
 // 获取或初始化某个分组在 state 中的独立调度状态
 function getGroupSchedule(state, groupId) {
   if (!state.groups) state.groups = {};
@@ -876,7 +897,7 @@ function syncLegacyStateView(state, cfg) {
 }
 
 // 按 round-robin 顺序取下一个候选（支持组内或全局）
-function pickNextDuty(cfg, state, excludeId, targetAccounts = null, rotationIndex = 0) {
+function pickNextDuty(cfg, state, excludeId, targetAccounts = null, rotationIndex = 0, now = bjNow()) {
   const pool = targetAccounts || cfg.accounts;
   const n = pool.length;
   if (n <= 1) return null;
@@ -884,7 +905,10 @@ function pickNextDuty(cfg, state, excludeId, targetAccounts = null, rotationInde
     const idx = (rotationIndex + i) % n;
     const acc = pool[idx];
     if (acc.id === excludeId) continue;
-    if (state.accounts[acc.id]?.exhausted) continue;
+    const st = state.accounts[acc.id] || {};
+    if (st.exhausted) continue;
+    const mo = refreshManualOverride(st, acc, now);
+    if (mo?.action === 'stop') continue;
     return { acc, idx };
   }
   return null;
@@ -904,6 +928,13 @@ async function stopAndConfirm(acc) {
 async function syncScheduledInstance(env, cfg, state, engine, acc, now) {
   const st = state.accounts[acc.id] || {};
   const isInside = inTimeRange(now.hhmm, acc.startTime, acc.stopTime);
+
+  // 检查 manualOverride 边缘触发判定
+  const mo = refreshManualOverride(st, acc, now);
+  if (mo) {
+    // 仍处于当时手动操作的相同时段区间内，保持人工操作状态，不逆转
+    return;
+  }
 
   if (!isInside) {
     if (st.ecsStatus === 'Running') {
@@ -1102,8 +1133,20 @@ async function runEngineCron(env, engine) {
 
     // 若未开启定时轮换，优先检查是否应由用户指定的主实例（未耗尽）当班
     if (rotationMinutes <= 0 && group.primaryAccountId) {
-      const preferred = groupAccounts.find((a) => a.id === group.primaryAccountId && !state.accounts[a.id]?.exhausted);
-      if (preferred && gSched.dutyAccountId !== preferred.id) {
+      const preferred = groupAccounts.find((a) => {
+        if (a.id !== group.primaryAccountId) return false;
+        const st = state.accounts[a.id] || {};
+        if (st.exhausted) return false;
+        const mo = refreshManualOverride(st, a, now);
+        return mo?.action !== 'stop';
+      });
+      // 如果当前当班机处于用户手动启动接管状态，且主实例未被显式启动，则不强行抢占当班
+      const curDutySt = gSched.dutyAccountId ? (state.accounts[gSched.dutyAccountId] || {}) : null;
+      const curDutyAcc = groupAccounts.find((x) => x.id === gSched.dutyAccountId);
+      const curDutyMo = (curDutySt && curDutyAcc) ? refreshManualOverride(curDutySt, curDutyAcc, now) : null;
+      const curDutyIsManualStart = curDutyMo?.action === 'start';
+
+      if (preferred && gSched.dutyAccountId !== preferred.id && !curDutyIsManualStart) {
         gSched.dutyAccountId = preferred.id;
         gSched.dutySince = Date.now();
         gSched.rotationIndex = groupAccounts.findIndex((a) => a.id === preferred.id);
@@ -1127,13 +1170,20 @@ async function runEngineCron(env, engine) {
 
     let duty = groupAccounts.find((a) => a.id === gSched.dutyAccountId);
     if (!duty) {
-      // 优先看是否配置了主实例（且未耗尽），否则取第 1 个未耗尽实例
+      // 优先看是否配置了主实例（且未耗尽且未被手动关机），否则取第 1 个符合条件的实例
+      const isEligible = (a) => {
+        const st = state.accounts[a.id] || {};
+        if (st.exhausted) return false;
+        const mo = refreshManualOverride(st, a, now);
+        return mo?.action !== 'stop';
+      };
       const preferred = group.primaryAccountId
-        ? groupAccounts.find((a) => a.id === group.primaryAccountId && !state.accounts[a.id]?.exhausted)
+        ? groupAccounts.find((a) => a.id === group.primaryAccountId && isEligible(a))
         : null;
-      const first = preferred || groupAccounts.find((a) => !state.accounts[a.id]?.exhausted);
+      const first = preferred || groupAccounts.find(isEligible);
       if (!first) {
-        if (gSched.fusedMonth !== state.month) {
+        const allExhausted = groupAccounts.every((a) => state.accounts[a.id]?.exhausted);
+        if (allExhausted && gSched.fusedMonth !== state.month) {
           gSched.fusedMonth = state.month;
           await engine.saveState(state);
           await appendLogSafe(env, 'AUDIT', `🔴 [${group.name}] 全部实例额度耗尽`, `本月组内不再自动开机（${state.month}）`);
@@ -1161,7 +1211,7 @@ async function runEngineCron(env, engine) {
 
     if (needRotation) {
       const reason = dutyState?.exhausted ? `额度耗尽（${dutyState.reason}）` : '定时轮换到期';
-      const next = pickNextDuty(cfg, state, duty.id, groupAccounts, gSched.rotationIndex);
+      const next = pickNextDuty(cfg, state, duty.id, groupAccounts, gSched.rotationIndex, now);
       if (!next) {
         const fRes = await fuseAndStopDuty(env, cfg, state, engine, duty, reason, group);
         syncLegacyStateView(state, cfg);
@@ -1215,6 +1265,20 @@ async function keepAliveDuty(env, cfg, state, engine, duty, dutyState, now, grou
       return setFault(env, engine, state, 'INSTANCE_NOT_FOUND', `${duty.name}: 实例 ${duty.instanceId} 不存在或已被释放`, null, { accountId: duty.id });
     }
     return setFault(env, engine, state, 'ECS_DESCRIBE_FAILED', `${duty.name}: ${desc.error}`);
+  }
+
+  const isInside = inTimeRange(now.hhmm, duty.startTime, duty.stopTime);
+  const st = state.accounts[duty.id] || {};
+
+  // 检查 manualOverride 边缘触发判定
+  const mo = refreshManualOverride(st, duty, now);
+  if (mo) {
+    if (mo.action === 'stop' && desc.status === 'Stopped') {
+      return { ok: true, duty: duty.id, status: 'Stopped', manualStopped: true };
+    }
+    if (mo.action === 'start' && desc.status === 'Running') {
+      return { ok: true, duty: duty.id, status: 'Running', manualStarted: true };
+    }
   }
 
   // 保活开关 + 允许运行时段
@@ -1814,6 +1878,7 @@ export default {
           scheduleEnabled: !!a.scheduleEnabled,
           startTime: normalizeHHMM(a.startTime, '00:00'),
           stopTime: normalizeHHMM(a.stopTime, '23:59'),
+          manualOverride: st.manualOverride || null,
         };
       });
       return json({
@@ -1877,52 +1942,134 @@ export default {
           const acc = cfg.accounts.find((a) => a.id === body.accountId);
           if (!acc) return json({ error: '实例不存在' }, 404);
           if (!isConfigured(acc)) return json({ error: '实例配置不完整（缺 AK/SK/地域/实例 ID）' }, 400);
+
+          const group = findGroup(cfg, acc.groupId || 'group-default');
+          const isDdnsGroup = isGroupDdnsOrRotation(group);
+          const state = await engine.loadState();
+          const now = bjNow();
+          const inWindow = inTimeRange(now.hhmm, acc.startTime, acc.stopTime);
+
+          if (isDdnsGroup && group) {
+            const gSched = getGroupSchedule(state, group.id);
+            const currentDutyId = gSched.dutyAccountId;
+            if (currentDutyId && currentDutyId !== acc.id) {
+              const off = findAccount(cfg, currentDutyId);
+              if (off) {
+                await appendLogSafe(env, 'AUDIT', `[${group.name}] 手动启动切班`, `${acc.name} 接替 ${off.name}`);
+                state.accounts = state.accounts || {};
+                state.accounts[acc.id] = {
+                  ...(state.accounts[acc.id] || {}),
+                  manualOverride: { action: 'start', inWindow, at: Date.now(), date: now.ymd },
+                };
+                const tRes = await beginTransition(env, cfg, state, engine, acc, off, 'SHIFT', '用户手动启动切换当班', group);
+                syncLegacyStateView(state, cfg);
+                return json({ ok: true, transition: true, message: `已触发换班切机（${acc.name} 接替 ${off.name}）`, detail: tRes });
+              }
+            }
+          }
+
           const started = await startEcs(acc);
           if (!started.ok) return json({ error: started.error || '启动失败' }, 500);
           await appendLogSafe(env, 'AUDIT', '手动启动实例', `${acc.name} (${acc.instanceId})`);
+
           // 尝试同步一次 ECS 状态
           const desc = await describeEcs(acc);
-          if (desc.ok) {
-            await engine.mutate((st) => {
-              st.accounts = st.accounts || {};
-              const a = st.accounts[acc.id] || {};
-              st.accounts[acc.id] = {
-                ...a,
-                ecsStatus: desc.status,
-                ecsStoppedMode: desc.stoppedMode,
-                ecsEip: desc.eip || a.ecsEip,
-                ecsError: null,
-              };
-              return st;
-            });
-          }
-          return json({ ok: true });
+          await engine.mutate((st) => {
+            st.accounts = st.accounts || {};
+            const a = st.accounts[acc.id] || {};
+            st.accounts[acc.id] = {
+              ...a,
+              ecsStatus: desc.ok ? desc.status : a.ecsStatus,
+              ecsStoppedMode: desc.ok ? desc.stoppedMode : a.ecsStoppedMode,
+              ecsEip: (desc.ok && desc.eip) ? desc.eip : a.ecsEip,
+              ecsError: null,
+              manualOverride: { action: 'start', inWindow, at: Date.now(), date: now.ymd },
+            };
+            if (isDdnsGroup && group) {
+              const gSched = getGroupSchedule(st, group.id);
+              if (!gSched.dutyAccountId) {
+                gSched.dutyAccountId = acc.id;
+                gSched.dutySince = Date.now();
+                const grpAccs = cfg.accounts.filter((x) => (x.groupId || 'group-default') === group.id);
+                gSched.rotationIndex = grpAccs.findIndex((x) => x.id === acc.id);
+              }
+            }
+            return st;
+          });
+          return json({ ok: true, message: `已成功启动实例【${acc.name}】` });
         }
         case 'stop_instance': {
           const cfg = await getConfig(env);
           const acc = cfg.accounts.find((a) => a.id === body.accountId);
           if (!acc) return json({ error: '实例不存在' }, 404);
           if (!isConfigured(acc)) return json({ error: '实例配置不完整（缺 AK/SK/地域/实例 ID）' }, 400);
+
+          const group = findGroup(cfg, acc.groupId || 'group-default');
+          const isDdnsGroup = isGroupDdnsOrRotation(group);
+          const state = await engine.loadState();
+          const now = bjNow();
+          const inWindow = inTimeRange(now.hhmm, acc.startTime, acc.stopTime);
+
+          if (isDdnsGroup && group) {
+            const gSched = getGroupSchedule(state, group.id);
+            if (gSched.dutyAccountId === acc.id) {
+              const groupAccounts = cfg.accounts.filter((a) => (a.groupId || 'group-default') === group.id);
+              const next = pickNextDuty(cfg, state, acc.id, groupAccounts, gSched.rotationIndex, now);
+              if (next) {
+                await appendLogSafe(env, 'AUDIT', `[${group.name}] 手动停机切班`, `${acc.name} -> ${next.acc.name}`);
+                state.accounts = state.accounts || {};
+                state.accounts[acc.id] = {
+                  ...(state.accounts[acc.id] || {}),
+                  manualOverride: { action: 'stop', inWindow, at: Date.now(), date: now.ymd },
+                };
+                const tRes = await beginTransition(env, cfg, state, engine, next.acc, acc, 'SHIFT', '用户手动停机切班', group);
+                syncLegacyStateView(state, cfg);
+                return json({ ok: true, transition: true, message: `已触发换班切机（${next.acc.name} 接替 ${acc.name}）`, detail: tRes });
+              }
+
+              // 无备用机可用：直接停机，清空当班标记，避免保活重新拉起
+              const stopped = await stopEcs(acc);
+              if (!stopped.ok) return json({ error: stopped.error || '停机失败' }, 500);
+              await appendLogSafe(env, 'AUDIT', `[${group.name}] 手动停机（无可用备机）`, `${acc.name} (${acc.instanceId})`);
+              const desc = await describeEcs(acc);
+              const gSchedSt = getGroupSchedule(state, group.id);
+              gSchedSt.dutyAccountId = null;
+              gSchedSt.dutySince = 0;
+              state.accounts = state.accounts || {};
+              const a = state.accounts[acc.id] || {};
+              state.accounts[acc.id] = {
+                ...a,
+                ecsStatus: desc.ok ? desc.status : 'Stopped',
+                ecsStoppedMode: desc.ok ? desc.stoppedMode : a.ecsStoppedMode,
+                ecsEip: (desc.ok && desc.eip) ? desc.eip : a.ecsEip,
+                ecsError: null,
+                manualOverride: { action: 'stop', inWindow, at: Date.now(), date: now.ymd },
+              };
+              syncLegacyStateView(state, cfg);
+              await engine.saveState(state);
+              return json({ ok: true, message: `已停机【${acc.name}】，组内无可用备机已下线` });
+            }
+          }
+
           const stopped = await stopEcs(acc);
           if (!stopped.ok) return json({ error: stopped.error || '停机失败' }, 500);
           await appendLogSafe(env, 'AUDIT', '手动节省停机', `${acc.name} (${acc.instanceId})`);
           // 尝试同步一次 ECS 状态
           const desc = await describeEcs(acc);
-          if (desc.ok) {
-            await engine.mutate((st) => {
-              st.accounts = st.accounts || {};
-              const a = st.accounts[acc.id] || {};
-              st.accounts[acc.id] = {
-                ...a,
-                ecsStatus: desc.status,
-                ecsStoppedMode: desc.stoppedMode,
-                ecsEip: desc.eip || a.ecsEip,
-                ecsError: null,
-              };
-              return st;
-            });
-          }
-          return json({ ok: true });
+          await engine.mutate((st) => {
+            st.accounts = st.accounts || {};
+            const a = st.accounts[acc.id] || {};
+            st.accounts[acc.id] = {
+              ...a,
+              ecsStatus: desc.ok ? desc.status : a.ecsStatus,
+              ecsStoppedMode: desc.ok ? desc.stoppedMode : a.ecsStoppedMode,
+              ecsEip: (desc.ok && desc.eip) ? desc.eip : a.ecsEip,
+              ecsError: null,
+              manualOverride: { action: 'stop', inWindow, at: Date.now(), date: now.ymd },
+            };
+            return st;
+          });
+          return json({ ok: true, message: `已成功停机【${acc.name}】` });
         }
         case 'clear_logs':
           await env.STATE_KV.put('app_logs', '[]');
@@ -2462,6 +2609,7 @@ function renderCardHtml(a){
     +   '</div>'
     +   '<div class="flex gap-1 flex-wrap justify-end">'
     +     (a.duty ? '<span class="px-2 py-0.5 rounded-full text-[10px] font-bold bg-emerald-100 text-emerald-800 border border-emerald-300">当班</span>' : '')
+    +     (a.manualOverride ? '<span class="px-2 py-0.5 rounded-full text-[10px] font-bold bg-amber-100 text-amber-800 border border-amber-300" title="手动接管中，将在跨过下一个运行时段节点时恢复自动调度">手动接管</span>' : '')
     +     (a.exhausted ? '<span class="px-2 py-0.5 rounded-full text-[10px] font-bold bg-rose-100 text-rose-700 border border-rose-300">耗尽</span>' : '')
     +     '<span class="px-2 py-0.5 rounded-full text-[10px] font-bold ' + statusStyle(status) + '">' + esc(status) + '</span>'
     +   '</div>'
@@ -2873,7 +3021,45 @@ async function saveInstanceSettings(){
 async function controlInstance(action, accountId, name){
   const isStop = action === 'stop_instance';
   const label = isStop ? '节省停机' : '启动';
-  if (!confirm('确定要对实例【' + name + '】执行【' + label + '】操作吗？')) return;
+
+  const acc = (CFG?.accounts || []).find(x => x.id === accountId);
+  const stateAcc = (STATE?.accounts || []).find(x => x.id === accountId);
+  const grpId = acc?.groupId || stateAcc?.groupId || 'group-default';
+  const grp = (CFG?.groups || []).find(g => g.id === grpId);
+  const hasDdns = !!(grp?.cf?.enabled && grp?.cf?.domainName && grp?.cf?.apiToken);
+  const rotationMinutes = Number(grp?.rotationIntervalMinutes || 0);
+  const isDdnsGroup = hasDdns || rotationMinutes > 0;
+
+  let confirmMsg = '';
+
+  if (isStop) {
+    if (isDdnsGroup && stateAcc?.duty) {
+      const groupAccounts = (STATE?.accounts || []).filter(x => (x.groupId || 'group-default') === grpId);
+      const standbyAcc = groupAccounts.find(x => x.id !== accountId && !x.exhausted && x.configured && (!x.manualOverride || x.manualOverride.action !== 'stop'));
+      if (standbyAcc) {
+        confirmMsg = '【' + name + '】当前为当班解析实例。手动节省停机将自动启动备用机【' + standbyAcc.name + '】并平移域名解析，确认换班停机？';
+      } else {
+        confirmMsg = '【' + name + '】当前为组内唯一可用当班实例。执行节省停机后解析服务将下线且不再自动保活，确认停机？';
+      }
+    } else {
+      confirmMsg = '确定要对实例【' + name + '】执行节省停机操作吗？';
+    }
+  } else {
+    // start_instance
+    if (isDdnsGroup) {
+      const groupAccounts = (STATE?.accounts || []).filter(x => (x.groupId || 'group-default') === grpId);
+      const currentDuty = groupAccounts.find(x => x.duty && x.id !== accountId);
+      if (currentDuty) {
+        confirmMsg = '【' + name + '】为备用实例。手动启动将触发平滑切班使其接管域名解析，原当班机【' + currentDuty.name + '】将换下停机，确认启动？';
+      } else {
+        confirmMsg = '确定要启动实例【' + name + '】吗？';
+      }
+    } else {
+      confirmMsg = '确定要启动实例【' + name + '】吗？';
+    }
+  }
+
+  if (!confirm(confirmMsg)) return;
   try {
     const r = await api('/api/action', {
       method: 'POST',
@@ -2881,7 +3067,7 @@ async function controlInstance(action, accountId, name){
       body: JSON.stringify({ action: action, accountId: accountId })
     });
     if (r && r.error) alert(label + '失败: ' + r.error);
-    else alert('已成功发送' + label + '指令');
+    else alert(r?.message || ('已成功发送' + label + '指令'));
     await refresh();
   } catch(e) {
     alert(label + '请求出错: ' + e.message);
