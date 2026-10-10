@@ -194,7 +194,7 @@ function check(name, cond, extra) {
 
 const M = await import(pathToFileURL(TESTMOD).href);
   const {
-  runEngineCron, defaultState, trafficClass, quotaForClass,
+  runEngineCron, executeCron, getEngine, defaultState, trafficClass, quotaForClass,
   resolveTrafficThreshold, resolveBillThreshold, resolveKeepAlive,
   inTimeRange, evaluateExhausted, validateConfig, bssEndpoint,
   probeBilling, reconcileAndClearFault, renderHtml, sanitizeConfig,
@@ -1323,6 +1323,56 @@ console.log('\n[25] 手动操作与定时运行时段（方案 A 边缘触发）
     const afterCronSt = await priEng.loadState();
     check('巡检不会将人工上位抢回 primaryAccountId', afterCronSt.groups['g-pri'].dutyAccountId === 'secB', afterCronSt.groups['g-pri']);
   }
+}
+
+// ============================================================================
+console.log('\n[26] executeCron 稳态 KV 读写次数与日报单次触发');
+{
+  resetWorld();
+  const groups = [{
+    id: 'g-kv', name: 'KV审计组', rotationIntervalMinutes: 60, primaryAccountId: null,
+    cf: { enabled: true, apiToken: 't', zoneId: 'z', recordId: 'r', domainName: 'kv.example.com' },
+  }];
+  const accounts = [acc('kv1', { groupId: 'g-kv' }), acc('kv2', { groupId: 'g-kv' })];
+  seed(accounts, 'i-kv1');
+  world.dns.content = world.ecs['i-kv1'].eip;
+  const cfg = baseConfig(accounts, groups);
+  const st = {
+    ...defaultState(),
+    month: cstMonth(),
+    lastBillCheck: Date.now(),
+    groups: {
+      'g-kv': { dutyAccountId: 'kv1', dutySince: Date.now(), rotationIndex: 0, transition: null, startAttempt: null, fusedMonth: cstMonth() },
+    },
+  };
+
+  const store = { app_config: JSON.stringify(cfg), app_logs: '[]', state_v2: JSON.stringify(st) };
+  let getCount = 0, putCount = 0;
+  const env = {
+    store,
+    STATE_KV: {
+      async get(k, opts) {
+        getCount++;
+        const v = store[k];
+        if (v === undefined) return null;
+        return opts?.type === 'json' ? JSON.parse(v) : v;
+      },
+      async put(k, v) {
+        putCount++;
+        store[k] = v;
+      },
+      async delete(k) { delete store[k]; },
+    },
+  };
+
+  // 稳态第一轮先对齐并排除初始化开销，测量后续稳态每轮调用
+  await executeCron(env);
+  getCount = 0;
+  putCount = 0;
+  const res = await executeCron(env);
+  check('executeCron 正常返回 ok', res?.ok === true, res);
+  check('稳态一次 executeCron 的 KV 读为 2 次', getCount === 2, getCount);
+  check('稳态一次 executeCron 的 KV 写为 1 次', putCount === 1, putCount);
 }
 
 console.log(`\n${pass} passed, ${fail} failed`);

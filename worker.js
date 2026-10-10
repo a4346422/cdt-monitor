@@ -974,9 +974,9 @@ async function syncScheduledInstance(env, cfg, state, engine, acc, now) {
 
 // ---------------------------------------------------------------- 主循环
 
-async function runEngineCron(env, engine) {
-  const cfg = await getConfig(env);
-  const state = await engine.loadState();
+async function runEngineCron(env, engine, preCfg, preState) {
+  const cfg = preCfg || await getConfig(env);
+  const state = preState || await engine.loadState();
   const now = bjNow();
 
   // ---- 跨月：所有账号额度恢复
@@ -1104,6 +1104,7 @@ async function runEngineCron(env, engine) {
   const groups = (cfg.groups && cfg.groups.length > 0) ? cfg.groups : [defaultGroup()];
   let cronResult = { ok: true };
 
+  try {
   for (const group of groups) {
     const groupAccounts = cfg.accounts.filter((a) => (a.groupId || 'group-default') === group.id);
     if (!groupAccounts.length) continue;
@@ -1246,8 +1247,11 @@ async function runEngineCron(env, engine) {
     }
   }
 
-  syncLegacyStateView(state, cfg);
-  await engine.saveState(state);
+  } finally {
+    // 稳态统一落盘；提前 return（换班/熔断）会多写一次，属有意为之，用于兜住异常退出路径
+    syncLegacyStateView(state, cfg);
+    await engine.saveState(state);
+  }
   return cronResult;
 }
 
@@ -1303,7 +1307,7 @@ async function keepAliveDuty(env, cfg, state, engine, duty, dutyState, now, grou
   if (desc.status === 'Running') {
     gSched.startAttempt = null;
     state.keepAliveAt = now.iso;
-    await engine.saveState(state);
+    // 稳态不再单独落盘：由 runEngineCron 末尾统一保存（见 try/finally）
     return { ok: true, duty: duty.id, status: 'Running', trafficGb: dutyState?.trafficGb };
   }
 
@@ -1681,9 +1685,9 @@ function getEngine(env) {
 async function executeCron(env) {
   try {
     const engine = getEngine(env);
-    const result = await runEngineCron(env, engine);
     const cfg = await getConfig(env);
     const state = await engine.loadState();
+    const result = await runEngineCron(env, engine, cfg, state);
     await maybeDailyReport(env, cfg, state, engine);
     return result ?? { ok: true };
   } catch (e) {
