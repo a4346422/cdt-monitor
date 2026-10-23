@@ -504,6 +504,59 @@ console.log('\n[9] fail-closed');
   check('启用了账单阈值但账单不可用 → 故障', st.fault && st.fault.code === 'BILL_QUERY_FAILED', st.fault);
 }
 
+{
+  // 账单故障自愈：故障期间现场重查成功就自动解除
+  resetWorld();
+  const accounts = [acc('a')];
+  seed(accounts, 'i-a');
+  const cfg = baseConfig(accounts);
+  cfg.system.billThreshold = 5;
+  const env = makeEnv(cfg);
+  const st = { ...defaultState(), month: cstMonth(), dutyAccountId: 'a', dutySince: Date.now() };
+  st.fault = { code: 'BILL_QUERY_FAILED', at: new Date().toISOString(), message: '网络错误: timeout', accountId: null };
+  st.accounts = { a: { billOk: false, billError: '网络错误: timeout' } };
+  const eng = makeEngine(st);
+  world.bill['ak-a'] = 1;
+  await runEngineCron(env, eng);
+  check('账单恢复后自动解除保护', st.fault === null, st.fault);
+  check('自愈后 billOk=true 且金额已刷新', st.accounts.a.billOk === true && st.accounts.a.billAmount === 1, st.accounts.a);
+  check('自愈后 billError 清空', st.accounts.a.billError === null, st.accounts.a.billError);
+}
+
+{
+  // 阈值关闭时，历史账单故障直接解除
+  resetWorld();
+  const accounts = [acc('a')];
+  seed(accounts, 'i-a');
+  const cfg = baseConfig(accounts);
+  cfg.system.billThreshold = 0;
+  const env = makeEnv(cfg);
+  const st = { ...defaultState(), month: cstMonth(), dutyAccountId: 'a', dutySince: Date.now() };
+  st.fault = { code: 'BILL_QUERY_FAILED', at: new Date().toISOString(), message: 'x', accountId: null };
+  const eng = makeEngine(st);
+  await runEngineCron(env, eng);
+  check('账单阈值关闭后自动解除保护', st.fault === null, st.fault);
+}
+
+{
+  // 未到账单周期时保留上次的错误，而不是清成 null
+  resetWorld();
+  const accounts = [acc('a')];
+  seed(accounts, 'i-a');
+  const cfg = baseConfig(accounts);
+  cfg.system.billThreshold = 0;
+  const env = makeEnv(cfg);
+  const st = { ...defaultState(), month: cstMonth(), dutyAccountId: 'a', dutySince: Date.now() };
+  const eng = makeEngine(st);
+  await runEngineCron(env, eng);
+  check('账单失败写入 lastBillAttempt', !!st.lastBillAttempt && st.lastBillAttempt.ok === false, st.lastBillAttempt);
+  check('失败原因写入 billError', !!st.accounts.a.billError, st.accounts.a);
+  st.lastBillCheck = Date.now();   // 未到下一轮
+  await runEngineCron(env, eng);
+  check('未到周期不清空 billError', !!st.accounts.a.billError, st.accounts.a);
+}
+
+
 // ============================================================================
 console.log('\n[10] 实例被释放');
 {

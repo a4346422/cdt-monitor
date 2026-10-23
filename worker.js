@@ -23,8 +23,12 @@
 
 const TZ = 'Asia/Shanghai';
 const REQUEST_TIMEOUT_MS = 10000;
-// BSS（账单/余额）接口普遍比 ECS/CDT 慢，单独给更长的超时，避免 10s 就判失败
-const BSS_TIMEOUT_MS = 25000;
+// BSS（账单/余额）接口普遍比 ECS/CDT 慢，单独给更长的超时，并减少重试，
+// 否则 25s × 3 次 × 3 个调用会把一轮 cron 拖到分钟级。
+const BSS_TIMEOUT_MS = 15000;
+const BSS_ATTEMPTS = 2;
+// 一轮账单阶段的总预算，超过就跳过剩余账号，避免 cron 越跑越久
+const BSS_PHASE_BUDGET_MS = 120000;
 const RETRY_ATTEMPTS = 3;
 
 // CDT 免费额度按地域类别分成两个独立池
@@ -108,6 +112,7 @@ function defaultState() {
     keepAliveAt: null,
     fusedMonth: null,
     lastBillCheck: 0,
+    lastBillAttempt: null,   // { at, ok, error, skipped } 上一轮账单查询的真实结果
     lastTrafficCheck: null,
     fault: null,
     dailyReportDate: null,
@@ -258,9 +263,9 @@ async function callAliyunOnce(host, region, params, ak, sk, timeoutMs = REQUEST_
   return data;
 }
 
-async function callAliyun(host, region, params, ak, sk, timeoutMs = REQUEST_TIMEOUT_MS) {
+async function callAliyun(host, region, params, ak, sk, timeoutMs = REQUEST_TIMEOUT_MS, attempts = RETRY_ATTEMPTS) {
   let last;
-  for (let attempt = 0; attempt < RETRY_ATTEMPTS; attempt++) {
+  for (let attempt = 0; attempt < attempts; attempt++) {
     try {
       return await callAliyunOnce(host, region, params, ak, sk, timeoutMs);
     } catch (e) {
@@ -417,7 +422,7 @@ async function queryBill(acc, { cycle, instanceId, hideZero, maxPages = 5 } = {}
     if (hideZero) params.IsHideZeroCharge = true;
     if (token) params.NextToken = token;
 
-    const res = await callAliyun(bss.host, bss.region, params, acc.ak, acc.sk, BSS_TIMEOUT_MS);
+    const res = await callAliyun(bss.host, bss.region, params, acc.ak, acc.sk, BSS_TIMEOUT_MS, BSS_ATTEMPTS);
     const data = res.Data || {};
     let rows = data.Items?.Item || data.Items || [];
     if (!Array.isArray(rows)) rows = [rows];
@@ -473,7 +478,7 @@ async function getAccountBalance(acc) {
     const res = await callAliyun(bss.host, bss.region, {
       Action: 'QueryAccountBalance',
       Version: '2017-12-14',
-    }, acc.ak, acc.sk, BSS_TIMEOUT_MS);
+    }, acc.ak, acc.sk, BSS_TIMEOUT_MS, BSS_ATTEMPTS);
     const data = res.Data || {};
     if (data.AvailableAmount == null) throw new Error('余额响应缺少 AvailableAmount');
     return {
@@ -1084,8 +1089,11 @@ async function runEngineCron(env, engine, preCfg, preState) {
   const bills = {};
   if (billDue && cfg.accounts.length) {
     // 串行查询：BSS 对并发很敏感，3N 并发容易排队到超时
+    const phaseStart = Date.now();
+    let billSkipped = 0;
     for (const acc of cfg.accounts) {
       if (!isConfigured(acc)) continue;
+      if (Date.now() - phaseStart > BSS_PHASE_BUDGET_MS) { billSkipped++; continue; }
       const account = await queryBillSafe(acc, { cycle: now.month });
       const instance = await queryBillSafe(acc, { cycle: now.month, instanceId: acc.instanceId });
       const balance = await getAccountBalance(acc);
@@ -1095,11 +1103,13 @@ async function runEngineCron(env, engine, preCfg, preState) {
     const billFailures = cfg.accounts
       .filter((a) => bills[a.id]?.account && !bills[a.id].account.ok)
       .map((a) => `${a.name}: ${bills[a.id].account.error || '账单不可用'}`);
+    if (billSkipped) billFailures.push(`${billSkipped} 个账号因本轮耗时超预算被跳过`);
     // 记录本轮结果：面板和故障自愈都靠它，不再被下一轮“未查询”覆盖
     state.lastBillAttempt = {
       at: Date.now(),
       ok: billFailures.length === 0,
       error: billFailures.join('; ') || null,
+      skipped: billSkipped,
     };
     if (billFailures.length) await appendLogSafe(env, 'WARN', '账单查询失败', billFailures.join('; '));
   }
@@ -1135,8 +1145,9 @@ async function runEngineCron(env, engine, preCfg, preState) {
   }
 
   // 启用了账单阈值但账号级账单查不出来的账号，fail-closed
+  // 注意：未配置完整的账号不参与该判定，否则会和自愈逻辑互相矛盾（每 2 分钟反复报故障）
   const billFailures = cfg.accounts
-    .filter((a) => resolveBillThreshold(a, cfg) > 0)
+    .filter((a) => isConfigured(a) && resolveBillThreshold(a, cfg) > 0)
     .filter((a) => state.accounts[a.id]?.billOk === false)
     .map((a) => `${a.name}: ${state.accounts[a.id].billError || state.lastBillAttempt?.error || '账单不可用'}`);
   if (billFailures.length) {
@@ -1758,7 +1769,14 @@ async function tryAutoClearFault(env, cfg, state, engine) {
     }
     const now = bjNow();
     const results = [];
-    for (const acc of targets) results.push({ acc, bill: await queryBillSafe(acc, { cycle: now.month }) });
+    const phaseStart = Date.now();
+    for (const acc of targets) {
+      if (Date.now() - phaseStart > BSS_PHASE_BUDGET_MS) {
+        results.push({ acc, bill: { ok: false, error: '本轮耗时超预算，稍后重试' } });
+        continue;
+      }
+      results.push({ acc, bill: await queryBillSafe(acc, { cycle: now.month }) });
+    }
     const failed = results.filter((r) => !r.bill.ok);
     if (failed.length) {
       state.lastBillAttempt = {
@@ -1779,7 +1797,9 @@ async function tryAutoClearFault(env, cfg, state, engine) {
         billError: null,
       };
     }
-    state.lastBillAttempt = { at: Date.now(), ok: true, error: null };
+    state.lastBillAttempt = { at: Date.now(), ok: true, error: null, skipped: 0 };
+    // 刚查过账号级账单，同步推进节流时间，避免同一轮再查一遍
+    state.lastBillCheck = Date.now();
     state.fault = null;
     await engine.saveState(state);
     await appendLogSafe(env, 'AUDIT', '自动解除保护', '账单查询已恢复，BILL_QUERY_FAILED 自动清除');
