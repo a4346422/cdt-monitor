@@ -104,6 +104,14 @@ KV 统一承载状态（`state_v2`）、配置（`app_config`）、会话（`ses
 这是整套系统里最重要的一条约束：如果把查询失败当成"用量为 0"，就会在一个已经超额 200 GB 的账号上
 继续跑一整天，然后收到一张真实的账单。
 
+账单这一路的失败处理还多做了几件事，因为 BSS 比 ECS/CDT 慢得多：
+
+- **串行查询**：不再对所有账号并发发 3 个 BSS 请求，避免被排队拖到超时；
+- **独立超时**：BSS 单次 15 秒、最多 2 次尝试（ECS/CDT 仍是 10 秒 × 3 次）；
+- **阶段预算**：一轮账单查询累计超过 120 秒就跳过剩余账号，保证 cron 不会被拖成分钟级；
+- **结果落盘**：每轮结果写进 `state.lastBillAttempt`（`at` / `ok` / `error` / `skipped`），
+  面板直接显示失败原因，不再出现"有金额、无错误"的迷惑状态。
+
 ### 3.3 停机必须确认进入节省停机
 
 发一条 `StopInstance` **不等于**停机成功。只有当实例状态是 `Stopped` 且
@@ -176,6 +184,9 @@ WAIT_STOP         停掉原当班实例，轮询确认 StopCharging
 故障的触发条件可能已经不成立（例如实例被释放后，用户已把它从配置里删掉）。
 
 - **自动解除**：`INSTANCE_NOT_FOUND` 且触发它的实例已不在配置里 → 下一轮巡检自动解除；
+- **账单故障自动解除**：`BILL_QUERY_FAILED` 在两种情况下自己消失 ——
+  相关账号的账单阈值已改成 0（该判定不再适用），或下一轮巡检现场重查账单成功（成功即解除并刷新金额）；
+  查失败则保留保护，并更新 `state.lastBillAttempt` 里的错误原因；
 - **手动解除**：点「状态对账并清除故障」，会**重新核实真实状态**再决定清不清。
   如果还有实例不存在，会明确告诉你是哪几台，而不是笼统拒绝。
 
@@ -305,8 +316,11 @@ EIP、OSS 等一切在花钱的东西 —— 它们烧的是同一个额度池�
 > 释放实例时**记得一并释放对应的 EIP**。三个闲置 EIP 一个月就是 $10+，
 > 比 ECS 计算费高两个数量级。
 
-面板的「账单接口诊断」会调用 `DescribeEips` 列出每个 EIP 的状态、绑定对象和计费方式，
+面板的「账单接口诊断」会调用 `DescribeEipAddresses`（VPC 接口）列出每个 EIP 的状态、绑定对象和计费方式，
 `Status = Available` 就是正在漏钱。
+
+> 这个接口需要 `vpc:DescribeEipAddresses` 权限。没授权时诊断会直接返回
+> `缺少 VPC 读权限：给该 AK 加 vpc:DescribeEipAddresses（如 AliyunVPCReadOnlyAccess）`。
 
 ### 5.5 接口细节
 
@@ -314,6 +328,7 @@ EIP、OSS 等一切在花钱的东西 —— 它们烧的是同一个额度池�
 |---|---|
 | CDT 流量 | `cdt.aliyuncs.com`，`RegionId=cn-hongkong`，`Version=2021-08-13`，`ListCdtInternetTraffic` |
 | ECS | `ecs.<regionId>.aliyuncs.com`，`Version=2014-05-26` |
+| EIP | `vpc.<regionId>.aliyuncs.com`，`Version=2016-04-28`，`DescribeEipAddresses` |
 | BSS（中国站） | `business.aliyuncs.com`，`region cn-hangzhou` |
 | BSS（国际站） | `business.ap-southeast-1.aliyuncs.com`，`region ap-southeast-1` |
 | 余额 | `QueryAccountBalance` → `Data.AvailableAmount` + `Data.Currency` |
@@ -322,6 +337,9 @@ EIP、OSS 等一切在花钱的东西 —— 它们烧的是同一个额度池�
 
 **`DescribeInstanceBill` 没有 `PageSize` 参数**，分页只有 `MaxResults`（默认 20，最大 300）+ `NextToken`。
 不看 `NextToken` 会静默漏掉条目。本实现用 `MaxResults=300` 并循环 `NextToken`。
+
+**EIP 列表只能走 VPC 网关。** `DescribeEips` 在 `vpc.<regionId>` 上返回 `InvalidAction.NotFound`，
+ECS 2014-05-26 里也没有这个动作；正确的动作是 `DescribeEipAddresses`，分页用 `PageNumber` / `PageSize`。
 
 `bssopenapi.aliyuncs.com` **不在官方端点表里**。用错端点时 `QueryAccountBalance` 会把失败
 吞成余额 `-`，面板上看不出任何异常 —— 所以端点必须写对。
@@ -341,7 +359,7 @@ EIP、OSS 等一切在花钱的东西 —— 它们烧的是同一个额度池�
 | `ecs:DescribeInstances` | 查实例状态、节省停机模式、公网 IP |
 | `ecs:StartInstance` | 启动实例（换班 / 保活） |
 | `ecs:StopInstance` | 停机实例 |
-| `ecs:DescribeEips` | 诊断用：列出 EIP 状态（可选，但强烈建议） |
+| `vpc:DescribeEipAddresses` | 诊断用：列出 EIP 状态（可选，但强烈建议） |
 | `bss:DescribeAcccount` | 查账户余额 |
 | `bss:DescribeInstanceBill` | 查当月账单（按账单阈值轮换时才需要） |
 
@@ -408,7 +426,7 @@ EIP、OSS 等一切在花钱的东西 —— 它们烧的是同一个额度池�
 | `ACCOUNT_NOT_CONFIGURED` | 实例缺 AK/SK/地域/实例 ID | 设置里补全 |
 | `CONFIG_INVALID` | 配置参数不合法 | 设置里按提示范围修正 |
 | `CDT_QUERY_FAILED` | 流量查询失败（fail-closed） | 检查 `cdt:ListCdtInternetTraffic` 权限 |
-| `BILL_QUERY_FAILED` | 账单查询失败（fail-closed） | 检查 `bss:DescribeInstanceBill` 权限，或把账单阈值设为 0 |
+| `BILL_QUERY_FAILED` | 账单查询失败（fail-closed） | 通常下一轮巡检现场重查成功即**自动解除**；持续失败再查 `bss:DescribeInstanceBill` 权限，或把账单阈值设为 0 |
 | `ECS_DESCRIBE_FAILED` | 查实例状态失败 | 检查 `ecs:DescribeInstances` 权限 |
 | `INSTANCE_NOT_FOUND` | 实例不存在或已被释放 | 设置里删除该实例或改成正确的实例 ID（**可自动解除**） |
 | `START_FAILED` | 重试窗口内启动始终失败 | 确认实例可用（常见于库存不足） |

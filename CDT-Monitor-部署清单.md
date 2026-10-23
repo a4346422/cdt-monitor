@@ -163,7 +163,7 @@ npx wrangler deploy --dry-run
 | `ecs:StopInstance` | 必需 |
 | `bss:DescribeAcccount` | 必需（查余额） |
 | `bss:DescribeInstanceBill` | 按账单阈值轮换时必需 |
-| `ecs:DescribeEips` | 可选，但强烈建议（诊断闲置 EIP） |
+| `vpc:DescribeEipAddresses` | 可选，但强烈建议（诊断闲置 EIP） |
 
 > ### ⚠️ `bss:DescribeAcccount` 是三个 c
 >
@@ -254,6 +254,7 @@ curl -s -X GET "https://api.cloudflare.com/client/v4/zones/<ZONE_ID>/dns_records
 - 四组账单：本月该实例 / 本月整账号 / 本月整账号仅非零 / 上月整账号
 - 按产品分组的费用（ecs / eip / oss / cdt …）
 - **EIP 列表**：状态、绑定到哪台实例、计费方式
+  （走 VPC 接口 `DescribeEipAddresses`，需要 `vpc:DescribeEipAddresses` 权限）
 
 ### 怎么读结果
 
@@ -263,6 +264,7 @@ curl -s -X GET "https://api.cloudflare.com/client/v4/zones/<ZONE_ID>/dns_records
 | `NotApplicable` | 国际站不支持该接口 → **不要启用账单阈值** |
 | `NoPermission` | 回第 5 步补 RAM 权限 |
 | 余额 `-` 或查询失败 | BSS 端点不对，或权限缺失 |
+| `eips.ok: false` + `Forbidden.RAM` | AK 缺 `vpc:DescribeEipAddresses`，去 RAM 补（如 `AliyunVPCReadOnlyAccess`） |
 
 ### 重点看两件事
 
@@ -327,7 +329,7 @@ curl -s -X GET "https://api.cloudflare.com/client/v4/zones/<ZONE_ID>/dns_records
 |---|---|
 | `INSTANCE_NOT_FOUND` | 设置里删除该实例或改成正确 ID。**从配置里删掉后会自动解除** |
 | `CDT_QUERY_FAILED` | 补 `cdt:ListCdtInternetTraffic` 权限 |
-| `BILL_QUERY_FAILED` | 补 `bss:DescribeInstanceBill` 权限，或把账单阈值设为 0 |
+| `BILL_QUERY_FAILED` | 一般不用管：下一轮巡检重查账单成功会自动解除。持续失败再补 `bss:DescribeInstanceBill` 权限，或把账单阈值设为 0 |
 | `DNS_UPDATE_FAILED` | 检查 CF Token / Zone ID / Record ID / 域名 |
 | `STOP_CHARGING_NOT_CONFIRMED` | **去控制台确认** —— 那台机器还在计费 |
 | `START_FAILED` | 多半是抢占式实例库存不足，稍后重试 |
@@ -380,7 +382,7 @@ curl -X POST "https://<你的域名>/api/action" \
 
 **阿里云**
 
-- [ ] 每个账号的 RAM 用户有全部六个权限
+- [ ] 每个账号的 RAM 用户有全部七个权限（含 `vpc:DescribeEipAddresses`）
 - [ ] `bss:DescribeAcccount` **是三个 c**（不要改）
 - [ ] 每台 ECS 绑定**固定 EIP**（不是自动分配的公网 IP）
 - [ ] **没有闲置的 EIP**（诊断里 `idle` 为 0）
