@@ -972,8 +972,9 @@ async function stopAndConfirm(acc) {
   };
 }
 
-async function syncScheduledInstance(env, cfg, state, engine, acc, now) {
-  const st = state.accounts[acc.id] || {};
+async function syncScheduledInstance(env, cfg, state, engine, acc, now, actions = null) {
+  state.accounts = state.accounts || {};
+  const st = state.accounts[acc.id] = state.accounts[acc.id] || {};
   const isInside = inTimeRange(now.hhmm, acc.startTime, acc.stopTime);
 
   // 检查 manualOverride 边缘触发判定
@@ -987,6 +988,7 @@ async function syncScheduledInstance(env, cfg, state, engine, acc, now) {
     if (st.ecsStatus === 'Running') {
       const stopRes = await stopAndConfirm(acc);
       st.ecsStatus = stopRes.ok ? 'Stopped' : st.ecsStatus;
+      if (stopRes.ok && actions) actions.push({ type: 'stop', name: acc.name, reason: '定时休眠' });
       st.ecsStoppedMode = stopRes.ok ? 'StopCharging' : st.ecsStoppedMode;
       await engine.saveState(state);
       await appendLogSafe(env, 'AUDIT', '定时休眠停机', `${acc.name}（不在运行时段 ${acc.startTime}~${acc.stopTime}）: ${stopRes.detail}`);
@@ -1006,6 +1008,7 @@ async function syncScheduledInstance(env, cfg, state, engine, acc, now) {
     const started = await startEcs(acc);
     if (started.ok) {
       st.ecsStatus = 'Running';
+      if (actions) actions.push({ type: 'start', name: acc.name, reason: '定时恢复' });
       await engine.saveState(state);
       await appendLogSafe(env, 'AUDIT', '定时恢复开机', `${acc.name}（已进入运行时段 ${acc.startTime}~${acc.stopTime}）`);
       await sendTelegram(env, cfg, '☀️ 【实例定时恢复开机】', [
@@ -1021,7 +1024,7 @@ async function syncScheduledInstance(env, cfg, state, engine, acc, now) {
 
 // ---------------------------------------------------------------- 主循环
 
-async function runEngineCron(env, engine, preCfg, preState) {
+async function runEngineCron(env, engine, preCfg, preState, actions = null) {
   const cfg = preCfg || await getConfig(env);
   const state = preState || await engine.loadState();
   const now = bjNow();
@@ -1210,7 +1213,7 @@ async function runEngineCron(env, engine, preCfg, preState) {
       gSched.startAttempt = null;
       for (const acc of groupAccounts) {
         if (!acc.scheduleEnabled || !isConfigured(acc)) continue;
-        await syncScheduledInstance(env, cfg, state, engine, acc, now);
+        await syncScheduledInstance(env, cfg, state, engine, acc, now, actions);
       }
       continue;
     }
@@ -1317,7 +1320,7 @@ async function runEngineCron(env, engine, preCfg, preState) {
     }
 
     // 保活：对配置了轮换/DDNS 分组的当班实例执行保活
-    const kRes = await keepAliveDuty(env, cfg, state, engine, duty, dutyState, now, group);
+    const kRes = await keepAliveDuty(env, cfg, state, engine, duty, dutyState, now, group, actions);
     if (kRes && (kRes.halted || kRes.waiting)) {
       syncLegacyStateView(state, cfg);
       return kRes;
@@ -1350,7 +1353,7 @@ async function runEngineCron(env, engine, preCfg, preState) {
 
 // ---------------------------------------------------------------- 保活
 
-async function keepAliveDuty(env, cfg, state, engine, duty, dutyState, now, group = null) {
+async function keepAliveDuty(env, cfg, state, engine, duty, dutyState, now, group = null, actions = null) {
   const gSched = group ? getGroupSchedule(state, group.id) : state;
   if (!isConfigured(duty)) {
     // 配置不完整的实例不参与调度，也不应拖停其他实例
@@ -1419,6 +1422,9 @@ async function keepAliveDuty(env, cfg, state, engine, duty, dutyState, now, grou
 
   const started = await startEcs(duty);
   if (started.ok) {
+    if (actions) actions.push({ type: 'start', name: duty.name, reason: '保活拉起' });
+    state.accounts = state.accounts || {};
+    state.accounts[duty.id] = { ...(state.accounts[duty.id] || {}), ecsStatus: 'Running', ecsError: null };
     gSched.startAttempt = null;
     state.keepAliveAt = now.iso;
     await engine.saveState(state);
@@ -1775,17 +1781,61 @@ function getEngine(env) {
   };
 }
 
+function snapshotInstanceStatus(state) {
+  const out = {};
+  for (const [id, st] of Object.entries(state.accounts || {})) out[id] = st?.ecsStatus || null;
+  return out;
+}
+
+// 一次巡检到底做了什么：靠前后状态对比得出，不依赖各分支的返回值形状
+function buildRunSummary(before, after, state, cfg, ms, result, actions = null) {
+  const nameOf = (id) => cfg.accounts.find((a) => a.id === id)?.name || id;
+  const started = [];
+  const stopped = [];
+  if (actions && actions.length) {
+    for (const a of actions) {
+      const label = a.reason ? `${a.name}（${a.reason}）` : a.name;
+      if (a.type === 'start') started.push(label);
+      else if (a.type === 'stop') stopped.push(label);
+    }
+  } else {
+    for (const [id, status] of Object.entries(after)) {
+      if (status === 'Running' && before[id] !== 'Running') started.push(nameOf(id));
+      else if (status === 'Stopped' && before[id] === 'Running') stopped.push(nameOf(id));
+    }
+  }
+  const duties = [];
+  for (const [gid, g] of Object.entries(state.groups || {})) {
+    if (!g?.dutyAccountId) continue;
+    const grp = (cfg.groups || []).find((x) => x.id === gid);
+    duties.push({ group: grp?.name || gid, name: nameOf(g.dutyAccountId) });
+  }
+  return {
+    ms,
+    started,
+    stopped,
+    duties,
+    fault: state.fault ? { code: state.fault.code, message: state.fault.message } : null,
+    skipped: result?.skipped ? (result.reason || 'skipped') : null,
+    transition: result?.transition || null,
+  };
+}
+
 async function executeCron(env) {
+  const startedAt = Date.now();
   try {
     const engine = getEngine(env);
     const cfg = await getConfig(env);
     const state = await engine.loadState();
-    const result = await runEngineCron(env, engine, cfg, state);
+    const before = snapshotInstanceStatus(state);
+    const actions = [];
+    const result = await runEngineCron(env, engine, cfg, state, actions);
     await maybeDailyReport(env, cfg, state, engine);
-    return result ?? { ok: true };
+    const run = buildRunSummary(before, snapshotInstanceStatus(state), state, cfg, Date.now() - startedAt, result, actions);
+    return { ...(result ?? { ok: true }), run };
   } catch (e) {
     await appendLogSafe(env, 'ERROR', 'Cron执行异常', e.message);
-    return { error: e.message };
+    return { error: e.message, run: { ms: Date.now() - startedAt, started: [], stopped: [], duties: [], fault: null, error: e.message } };
   }
 }
 
@@ -2421,7 +2471,7 @@ function renderHtml() {
       <button onclick="addAccount()" class="px-3 py-1.5 rounded-xl bg-white hover:bg-zinc-100 border border-zinc-300 text-zinc-700 text-xs font-bold transition-colors shadow-sm">+ 添加实例</button>
       <button onclick="openGroupSettings()" class="px-3 py-1.5 rounded-xl bg-white hover:bg-zinc-100 border border-zinc-300 text-zinc-700 text-xs font-bold transition-colors shadow-sm">📁 分组与 DDNS</button>
       <button onclick="openGlobalSettings()" class="px-3 py-1.5 rounded-xl bg-white hover:bg-zinc-100 border border-zinc-300 text-zinc-700 text-xs font-bold transition-colors shadow-sm">⚙️ 全局设置</button>
-      <button onclick="act('trigger_cron')" class="px-3 py-1.5 rounded-xl bg-zinc-900 text-white text-xs font-bold shadow-sm">立即巡检</button>
+      <button id="cronBtn" onclick="act('trigger_cron')" class="px-3 py-1.5 rounded-xl bg-zinc-900 text-white text-xs font-bold shadow-sm disabled:opacity-60 disabled:cursor-wait">立即巡检</button>
       <button onclick="doLogout()" class="px-3 py-1.5 rounded-xl bg-white border border-zinc-200 text-zinc-700 text-xs font-bold">退出</button>
     </div>
   </header>
@@ -2616,20 +2666,62 @@ async function doLogin(){
 
 async function doLogout(){ await api('/api/logout', { method:'POST' }); showLogin(); }
 
+let toastTimer = null;
+function toast(msg, kind){
+  const el = document.getElementById('toast');
+  if (!el) return;
+  const styles = {
+    ok:    'bg-emerald-600 text-white',
+    warn:  'bg-amber-500 text-white',
+    error: 'bg-rose-600 text-white',
+    info:  'bg-zinc-900 text-white',
+  };
+  el.className = 'fixed bottom-4 right-4 z-50 max-w-sm rounded-2xl px-4 py-3 text-xs font-bold shadow-lg leading-relaxed ' + (styles[kind] || styles.info);
+  el.textContent = msg;
+  el.classList.remove('hidden');
+  if (toastTimer) clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => el.classList.add('hidden'), 6000);
+}
+
+function describeRun(r){
+  const run = r && r.run;
+  if (!run) return null;
+  if (run.error) return { kind:'error', msg:'❌ 巡检异常：' + run.error };
+  if (run.fault) return { kind:'error', msg:'🚨 已进入保护：' + run.fault.code + ' · ' + (run.fault.message || '') };
+  if (run.skipped) return { kind:'warn', msg:'⏭ 巡检已跳过：' + run.skipped };
+  const parts = ['✅ 巡检完成'];
+  if (typeof run.ms === 'number') parts.push((run.ms/1000).toFixed(1) + 's');
+  if (run.started && run.started.length) parts.push('启动 ' + run.started.length + '（' + run.started.join('、') + '）');
+  if (run.stopped && run.stopped.length) parts.push('停止 ' + run.stopped.length + '（' + run.stopped.join('、') + '）');
+  if ((!run.started || !run.started.length) && (!run.stopped || !run.stopped.length)) parts.push('无需变更');
+  if (run.duties && run.duties.length) parts.push('当班 ' + run.duties.map(d => d.name).join('、'));
+  return { kind:'ok', msg: parts.join(' · ') };
+}
+
 async function act(action){
+  const btn = action === 'trigger_cron' ? document.getElementById('cronBtn') : null;
+  const label = btn ? btn.textContent : null;
+  if (btn) { btn.disabled = true; btn.textContent = '巡检中…'; }
   try {
     const r = await api('/api/action', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ action }) });
     if (action === 'test_tg') {
-      if (r && r.ok) alert('测试消息已发送');
-      else if (r && r.skipped) alert('未发送：Telegram 未启用或缺少 Bot Token / Chat ID');
-      else if (r && r.error) alert('发送失败：' + r.error);
-      else alert('发送结果未知');
-    } else if (r && r.cleared === false) alert('未能清除：' + (r.notes || []).join('；'));
-    else if (r && r.cleared === true) alert('已清除保护状态。' + (r.notes || []).join('；'));
-    else if (r && r.halted) alert('已进入保护状态：' + (r.fault?.code || ''));
-    else if (r && r.error) alert(r.error);
+      if (r && r.ok) toast('✅ 测试消息已发送', 'ok');
+      else if (r && r.skipped) toast('未发送：Telegram 未启用或缺少 Bot Token / Chat ID', 'warn');
+      else if (r && r.error) toast('❌ 发送失败：' + r.error, 'error');
+      else toast('发送结果未知', 'warn');
+    } else if (action === 'trigger_cron') {
+      const d = describeRun(r);
+      if (d) toast(d.msg, d.kind);
+      else if (r && r.error) toast('❌ ' + r.error, 'error');
+      else toast('巡检完成（未返回摘要）', 'ok');
+    } else if (r && r.cleared === false) toast('未能清除：' + (r.notes || []).join('；'), 'warn');
+    else if (r && r.cleared === true) toast('已清除保护状态。' + (r.notes || []).join('；'), 'ok');
+    else if (r && r.halted) toast('🚨 已进入保护状态：' + (r.fault?.code || ''), 'error');
+    else if (r && r.error) toast('❌ ' + r.error, 'error');
+    else toast('操作已提交', 'info');
     await refresh();
-  } catch(e){ alert(e.message); }
+  } catch(e){ toast('❌ ' + e.message, 'error'); }
+  finally { if (btn) { btn.disabled = false; btn.textContent = label; } }
 }
 
 async function probeBill(){
@@ -2812,11 +2904,25 @@ function renderLogs(){
   }).join('');
 }
 
+function relTime(iso){
+  const t = Date.parse(iso);
+  if (!isFinite(t)) return null;
+  const s = Math.max(0, Math.round((Date.now() - t) / 1000));
+  if (s < 60) return s + ' 秒前';
+  if (s < 3600) return Math.round(s / 60) + ' 分钟前';
+  if (s < 86400) return Math.round(s / 3600) + ' 小时前';
+  return Math.round(s / 86400) + ' 天前';
+}
+
 function renderStatus(){
   const duty = (STATE.accounts || []).find(a => a.duty);
   const line = document.getElementById('dutyLine');
-  if (STATE.fused) line.textContent = '本月全部账号额度耗尽';
-  else if (duty) line.textContent = '当班：' + duty.name + ' · ' + (STATE.lastTrafficCheck ? STATE.lastTrafficCheck.at.slice(0,16).replace('T',' ') : '');
+  const last = STATE.lastTrafficCheck && STATE.lastTrafficCheck.at;
+  const ago = last ? relTime(last) : null;
+  const clock = last ? last.slice(0,16).replace('T',' ') : null;
+  if (STATE.fused) line.textContent = '本月全部账号额度耗尽' + (ago ? ' · 上次巡检 ' + ago : '');
+  else if (duty) line.textContent = '当班：' + duty.name + ' · 上次巡检 ' + (ago || '—') + (clock ? '（' + clock + '）' : '');
+  else if (ago) line.textContent = '上次巡检 ' + ago + (clock ? '（' + clock + '）' : '');
   else line.textContent = '等待首次巡检';
 
   const fb = document.getElementById('faultBanner');
@@ -3352,6 +3458,8 @@ function accountRow(a){
   } catch(e){ showLogin(); }
 })();
 </script>
+<div id="toast" class="hidden fixed bottom-4 right-4 z-50 max-w-sm rounded-2xl px-4 py-3 text-xs font-bold shadow-lg leading-relaxed"></div>
+
 </body>
 </html>`;
 }

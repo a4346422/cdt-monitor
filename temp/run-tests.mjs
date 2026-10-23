@@ -1513,6 +1513,30 @@ console.log('\n[26] executeCron 稳态 KV 读写次数与日报单次触发');
   check('executeCron 正常返回 ok', res?.ok === true, res);
   check('稳态一次 executeCron 的 KV 读为 2 次', getCount === 2, getCount);
   check('稳态一次 executeCron 的 KV 写为 1 次', putCount === 1, putCount);
+  check('executeCron 返回 run 摘要', !!res?.run && typeof res.run.ms === 'number', res?.run);
+  check('run 摘要记录当班实例', Array.isArray(res?.run?.duties) && res.run.duties.some(d => d.name.includes('KV1')), res?.run?.duties);
+  check('稳态无变更时 started/stopped 为空', res?.run?.started.length === 0 && res?.run?.stopped.length === 0, res?.run);
+}
+
+{
+  // 巡检摘要要能反映“这次真的启动了谁”
+  resetWorld();
+  const accounts = [acc('a')];
+  accounts[0].scheduleEnabled = true;
+  accounts[0].startTime = '00:00';
+  accounts[0].stopTime = '23:59';
+  seed(accounts, null);                 // 实例处于 Stopped
+  const cfg = baseConfig(accounts);
+  const env = makeEnv(cfg);
+  // 预热 state：让上一轮已知 ecsStatus，摘要才能对比出“这次启动了谁”
+  env.store.state_v2 = JSON.stringify({
+    ...defaultState(), month: cstMonth(), dutyAccountId: null, dutySince: 0,
+    accounts: { a: { ecsStatus: 'Stopped' } },
+  });
+  const res = await executeCron(env);
+  check('启动动作进入 run.started', res?.run?.started.some(x => x.includes('账号 A')), res?.run);
+  check('启动后 state 立即变为 Running', JSON.parse(env.store.state_v2).accounts.a.ecsStatus === 'Running', JSON.parse(env.store.state_v2).accounts.a);
+  check('run 摘要无故障', res?.run?.fault === null, res?.run?.fault);
 }
 
 console.log(`\n${pass} passed, ${fail} failed`);
