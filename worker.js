@@ -1310,7 +1310,7 @@ async function runEngineCron(env, engine, preCfg, preState, actions = null) {
       const reason = dutyState?.exhausted ? `额度耗尽（${dutyState.reason}）` : '定时轮换到期';
       const next = pickNextDuty(cfg, state, duty.id, active, gSched.rotationIndex, now);
       if (!next) {
-        const fRes = await fuseAndStopDuty(env, cfg, state, engine, duty, reason, group);
+        const fRes = await fuseAndStopDuty(env, cfg, state, engine, duty, reason, group, actions);
         syncLegacyStateView(state, cfg);
         return fRes;
       }
@@ -1450,7 +1450,7 @@ async function keepAliveDuty(env, cfg, state, engine, duty, dutyState, now, grou
 
 // ---------------------------------------------------------------- 熔断
 
-async function fuseAndStopDuty(env, cfg, state, engine, duty, reason, group = null) {
+async function fuseAndStopDuty(env, cfg, state, engine, duty, reason, group = null, actions = null) {
   const gSched = group ? getGroupSchedule(state, group.id) : state;
   const desc = await describeEcs(duty);
   let detail = desc.ok ? `${desc.status}/${desc.stoppedMode}` : (desc.error || '状态未知');
@@ -1462,6 +1462,7 @@ async function fuseAndStopDuty(env, cfg, state, engine, duty, reason, group = nu
     detail = res.detail;
   }
 
+  if (confirmed && actions) actions.push({ type: 'stop', name: duty.name, reason: '额度耗尽' });
   gSched.dutyAccountId = null;
   gSched.dutySince = 0;
   gSched.fusedMonth = state.month;
@@ -1794,7 +1795,7 @@ function buildRunSummary(before, after, state, cfg, ms, result, actions = null) 
   const stopped = [];
   if (actions && actions.length) {
     for (const a of actions) {
-      const label = a.reason ? `${a.name}（${a.reason}）` : a.name;
+      const label = a.reason ? `${a.name}·${a.reason}` : a.name;
       if (a.type === 'start') started.push(label);
       else if (a.type === 'stop') stopped.push(label);
     }
@@ -1817,7 +1818,7 @@ function buildRunSummary(before, after, state, cfg, ms, result, actions = null) 
     duties,
     fault: state.fault ? { code: state.fault.code, message: state.fault.message } : null,
     skipped: result?.skipped ? (result.reason || 'skipped') : null,
-    transition: result?.transition || null,
+    transition: result?.transition === 'done' ? 'done' : (result?.transition ? 'started' : null),
   };
 }
 
@@ -2693,7 +2694,9 @@ function describeRun(r){
   if (typeof run.ms === 'number') parts.push((run.ms/1000).toFixed(1) + 's');
   if (run.started && run.started.length) parts.push('启动 ' + run.started.length + '（' + run.started.join('、') + '）');
   if (run.stopped && run.stopped.length) parts.push('停止 ' + run.stopped.length + '（' + run.stopped.join('、') + '）');
-  if ((!run.started || !run.started.length) && (!run.stopped || !run.stopped.length)) parts.push('无需变更');
+  if (run.transition === 'done') parts.push('换班完成');
+  else if (run.transition === 'started') parts.push('已开始换班');
+  if ((!run.started || !run.started.length) && (!run.stopped || !run.stopped.length) && !run.transition) parts.push('无需变更');
   if (run.duties && run.duties.length) parts.push('当班 ' + run.duties.map(d => d.name).join('、'));
   return { kind:'ok', msg: parts.join(' · ') };
 }

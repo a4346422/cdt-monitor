@@ -1539,5 +1539,23 @@ console.log('\n[26] executeCron 稳态 KV 读写次数与日报单次触发');
   check('run 摘要无故障', res?.run?.fault === null, res?.run?.fault);
 }
 
+{
+  // 换班会体现在 run 摘要里（started 归一化成短字符串，不塞整个换班对象）
+  resetWorld();
+  const groups = [{ id: 'g-r', name: '轮换组', rotationIntervalMinutes: 60,
+    cf: { enabled: true, apiToken: 't', zoneId: 'z', recordId: 'r', domainName: 'r.example.com' } }];
+  const accounts = [acc('r1', { groupId: 'g-r' }), acc('r2', { groupId: 'g-r' })];
+  seed(accounts, 'i-r1');
+  const cfg = baseConfig(accounts);
+  cfg.groups = groups;
+  const env = makeEnv(cfg);
+  env.store.state_v2 = JSON.stringify({
+    ...defaultState(), month: cstMonth(),
+    groups: { 'g-r': { dutyAccountId: 'r1', dutySince: Date.now() - 65 * 60000, rotationIndex: 0, transition: null, startAttempt: null } },
+  });
+  const res = await executeCron(env);
+  check('换班开始体现在 run.transition', res?.run?.transition === 'started', res?.run);
+}
+
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);
