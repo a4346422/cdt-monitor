@@ -487,44 +487,63 @@ async function getAccountBalance(acc) {
 }
 
 // EIP 列表：绑定状态、计费方式、绑到哪个实例。闲置（Available）的 EIP 会按小时计保有费。
-// DescribeEips 属于 VPC API（Version 2016-04-28，分页用 PageNumber/PageSize），
-// 不是 ECS 2014-05-26 的接口，用 ECS 端点会返回 InvalidAction.NotFound。
+// DescribeEips 不在 ECS 2014-05-26 里；国际站不同账号能用的 VPC 网关/动作名也不完全一致，
+// 所以按候选顺序逐个试（每个只试一次，不重试），命中即用并把 endpoint 回报出来。
+function eipCandidates(acc) {
+  const r = acc.regionId;
+  const list = [
+    { host: `vpc.${r}.aliyuncs.com`, version: '2016-04-28', action: 'DescribeEips' },
+    { host: `vpc.${r}.aliyuncs.com`, version: '2016-04-28', action: 'DescribeEipAddresses' },
+    { host: 'vpc.ap-southeast-1.aliyuncs.com', version: '2016-04-28', action: 'DescribeEips' },
+    { host: 'vpc.ap-southeast-1.aliyuncs.com', version: '2016-04-28', action: 'DescribeEipAddresses' },
+    { host: `ecs.${r}.aliyuncs.com`, version: '2014-05-26', action: 'DescribeEipAddresses' },
+  ];
+  return acc.siteType === 'international' ? list : list.slice(0, 2);
+}
+
 async function listEips(acc) {
-  try {
-    const eips = [];
-    let page = 1;
-    let total = null;
-    do {
-      const params = {
-        Action: 'DescribeEips',
-        Version: '2016-04-28',
-        RegionId: acc.regionId,
-        PageNumber: page,
-        PageSize: 100,
+  const attempts = [];
+  for (const ep of eipCandidates(acc)) {
+    try {
+      const eips = [];
+      let page = 1;
+      let total = null;
+      do {
+        const params = {
+          Action: ep.action,
+          Version: ep.version,
+          RegionId: acc.regionId,
+          PageNumber: page,
+          PageSize: 100,
+        };
+        const res = await callAliyunOnce(ep.host, acc.regionId, params, acc.ak, acc.sk);
+        let rows = res.Eips?.Eip || res.Eips || [];
+        if (!Array.isArray(rows)) rows = [rows];
+        for (const e of rows) {
+          eips.push({
+            allocationId: e?.AllocationId || null,
+            ip: e?.IpAddress || null,
+            status: e?.Status || 'Unknown',
+            boundTo: e?.InstanceId || null,
+            chargeType: e?.InternetChargeType || null,
+            bandwidth: e?.Bandwidth ?? null,
+            isp: e?.ISP || null,
+            name: e?.Name || '',
+          });
+        }
+        if (res.TotalCount != null) total = Number(res.TotalCount);
+        if (!rows.length || (total != null && eips.length >= total)) break;
+        page++;
+      } while (page <= 5);
+      return {
+        ok: true, count: eips.length, idle: eips.filter((e) => e.status === 'Available').length,
+        eips, endpoint: ep.host, version: ep.version, action: ep.action,
       };
-      const res = await callAliyun(`vpc.${acc.regionId}.aliyuncs.com`, acc.regionId, params, acc.ak, acc.sk);
-      let rows = res.Eips?.Eip || res.Eips || [];
-      if (!Array.isArray(rows)) rows = [rows];
-      for (const e of rows) {
-        eips.push({
-          allocationId: e?.AllocationId || null,
-          ip: e?.IpAddress || null,
-          status: e?.Status || 'Unknown',
-          boundTo: e?.InstanceId || null,
-          chargeType: e?.InternetChargeType || null,
-          bandwidth: e?.Bandwidth ?? null,
-          isp: e?.ISP || null,
-          name: e?.Name || '',
-        });
-      }
-      if (res.TotalCount != null) total = Number(res.TotalCount);
-      if (!rows.length || (total != null && eips.length >= total)) break;
-      page++;
-    } while (page <= 5);
-    return { ok: true, count: eips.length, idle: eips.filter((e) => e.status === 'Available').length, eips };
-  } catch (e) {
-    return { ok: false, error: e.message, code: e.code || null };
+    } catch (e) {
+      attempts.push({ host: ep.host, version: ep.version, action: ep.action, error: e.message, code: e.code || null });
+    }
   }
+  return { ok: false, error: attempts[0]?.error || 'EIP 查询失败', code: attempts[0]?.code || null, attempts };
 }
 
 // 只读诊断：确认某个账号能用哪些 BSS 接口 / 端点，以及账单里到底有什么
