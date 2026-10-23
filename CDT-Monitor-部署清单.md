@@ -317,6 +317,10 @@ curl -s -X GET "https://api.cloudflare.com/client/v4/zones/<ZONE_ID>/dns_records
 
 故障时引擎停止一切调度，直到故障被清除。面板的红色横幅会显示**故障码 + 消息 + 怎么解**。
 
+> 例外：**配置不完整的实例不会熔断全局**。缺少 AK / SK / 地域 / 实例 ID 的实例只从调度中排除
+> （不选当班、不轮换、不启停），同组其他实例照常运行，卡片上标「未配置完整 · 未纳入调度」。
+> 只有**有凭据但查询失败**（`CDT_QUERY_FAILED` / `BILL_QUERY_FAILED` / `ECS_DESCRIBE_FAILED`）才 fail-closed。
+
 **通用恢复流程：**
 
 1. 看横幅上的「👉」提示，按提示处理（通常是去设置里改配置或补权限）；
