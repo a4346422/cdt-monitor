@@ -539,6 +539,20 @@ console.log('\n[9] fail-closed');
 }
 
 {
+  // 旧版本遗留的 ACCOUNT_NOT_CONFIGURED 自动解除（该码已不再产生）
+  resetWorld();
+  const accounts = [acc('a')];
+  seed(accounts, 'i-a');
+  const cfg = baseConfig(accounts);
+  const env = makeEnv(cfg);
+  const st = { ...defaultState(), month: cstMonth(), dutyAccountId: 'a', dutySince: Date.now() };
+  st.fault = { code: 'ACCOUNT_NOT_CONFIGURED', at: new Date().toISOString(), message: 'x', accountId: 'a' };
+  const eng = makeEngine(st);
+  await runEngineCron(env, eng);
+  check('ACCOUNT_NOT_CONFIGURED 自动解除', st.fault === null, st.fault);
+}
+
+{
   // 未到账单周期时保留上次的错误，而不是清成 null
   resetWorld();
   const accounts = [acc('a')];
@@ -556,6 +570,41 @@ console.log('\n[9] fail-closed');
   check('未到周期不清空 billError', !!st.accounts.a.billError, st.accounts.a);
 }
 
+
+{
+  // 半配置实例不再熔断全局：只从调度中排除，并通知一次
+  resetWorld();
+  const accounts = [acc('a', { ak: '', sk: '' })];
+  const cfg = baseConfig(accounts);
+  cfg.system.billThreshold = 5;
+  const env = makeEnv(cfg);
+  const st = { ...defaultState(), month: cstMonth(), dutyAccountId: null, dutySince: 0 };
+  const eng = makeEngine(st);
+  await runEngineCron(env, eng);
+  check('半配置实例不触发保护', st.fault === null, st.fault);
+  check('半配置实例标记为未配置', st.accounts.a.configured === false, st.accounts.a);
+  check('半配置实例不下发启停', world.startCalls.length === 0 && world.stopCalls.length === 0, world.startCalls);
+  const tg = world.tg.length;
+  check('半配置实例发出通知', tg >= 1, tg);
+  await runEngineCron(env, eng);
+  check('半配置实例不重复通知', world.tg.length === tg, world.tg.length);
+}
+
+{
+  // 同组里有半配置实例时，其他实例照常定时开机
+  resetWorld();
+  const accounts = [acc('a'), acc('b', { ak: '', sk: '' })];
+  accounts[0].scheduleEnabled = true;
+  accounts[0].startTime = '00:00';
+  accounts[0].stopTime = '23:59';
+  seed(accounts, null);
+  const cfg = baseConfig(accounts);
+  const env = makeEnv(cfg);
+  const st = { ...defaultState(), month: cstMonth(), dutyAccountId: null, dutySince: 0 };
+  const eng = makeEngine(st);
+  await runEngineCron(env, eng);
+  check('半配置实例不阻塞同组定时开机', st.fault === null && world.startCalls.includes('i-a'), world.startCalls);
+}
 
 // ============================================================================
 console.log('\n[10] 实例被释放');

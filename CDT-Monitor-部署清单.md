@@ -328,6 +328,7 @@ curl -s -X GET "https://api.cloudflare.com/client/v4/zones/<ZONE_ID>/dns_records
 | 故障码 | 处理 |
 |---|---|
 | `INSTANCE_NOT_FOUND` | 设置里删除该实例或改成正确 ID。**从配置里删掉后会自动解除** |
+| `ACCOUNT_NOT_CONFIGURED` | 历史故障码，已不再产生。半配置实例现在只从调度中排除，遗留故障下一轮巡检自动解除；去设置补全即恢复 |
 | `CDT_QUERY_FAILED` | 补 `cdt:ListCdtInternetTraffic` 权限 |
 | `BILL_QUERY_FAILED` | 一般不用管：下一轮巡检重查账单成功会自动解除。持续失败再补 `bss:DescribeInstanceBill` 权限，或把账单阈值设为 0 |
 | `DNS_UPDATE_FAILED` | 检查 CF Token / Zone ID / Record ID / 域名 |

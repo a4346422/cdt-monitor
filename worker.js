@@ -945,6 +945,7 @@ function pickNextDuty(cfg, state, excludeId, targetAccounts = null, rotationInde
     const idx = (rotationIndex + i) % n;
     const acc = pool[idx];
     if (acc.id === excludeId) continue;
+    if (!isConfigured(acc)) continue;
     const st = state.accounts[acc.id] || {};
     if (st.exhausted) continue;
     const mo = refreshManualOverride(st, acc, now);
@@ -1075,10 +1076,14 @@ async function runEngineCron(env, engine, preCfg, preState) {
   }
   if (activeTr) return advanceTransition(env, cfg, state, engine, now);
 
-  // ---- 采集所有账号的流量
-  const traffic = await Promise.all(cfg.accounts.map((acc) => getCdtTraffic(acc)));
+  // ---- 采集所有账号的流量（未配置完整的实例不参与采集，也不参与任何判定）
+  const traffic = await Promise.all(cfg.accounts.map((acc) => (
+    isConfigured(acc)
+      ? getCdtTraffic(acc)
+      : Promise.resolve({ ok: false, skipped: true, gb: null, trafficClass: trafficClass(acc.regionId), breakdown: [], error: '未配置完整' })
+  )));
   const failed = [];
-  cfg.accounts.forEach((acc, i) => { if (!traffic[i].ok) failed.push(`${acc.name}: ${traffic[i].error}`); });
+  cfg.accounts.forEach((acc, i) => { if (isConfigured(acc) && !traffic[i].ok) failed.push(`${acc.name}: ${traffic[i].error}`); });
   if (failed.length) {
     return setFault(env, engine, state, 'CDT_QUERY_FAILED', failed.join('; '));
   }
@@ -1123,9 +1128,10 @@ async function runEngineCron(env, engine, preCfg, preState) {
     const instBill = b?.instance;
     const next = {
       ...prev,
-      trafficGb: traffic[i].gb,
-      trafficClass: traffic[i].trafficClass,
-      breakdown: traffic[i].breakdown,
+      configured: isConfigured(acc),
+      trafficGb: traffic[i].ok ? traffic[i].gb : (prev.trafficGb ?? null),
+      trafficClass: traffic[i].ok ? traffic[i].trafficClass : (prev.trafficClass ?? trafficClass(acc.regionId)),
+      breakdown: traffic[i].ok ? traffic[i].breakdown : (prev.breakdown || []),
       // 账号级应付金额：账单阈值用它
       billAmount: acctBill ? (acctBill.ok ? acctBill.amount : prev.billAmount ?? null) : (prev.billAmount ?? null),
       // 该实例应付金额：仅用于展示
@@ -1142,6 +1148,16 @@ async function runEngineCron(env, engine, preCfg, preState) {
     next.exhausted = verdict.exhausted;
     next.reason = verdict.reason;
     state.accounts[acc.id] = next;
+
+    // 配置从完整变成不完整（或首次出现）时通知一次，之后不再重复轰炸
+    if (!next.configured && prev.configured !== false) {
+      await appendLogSafe(env, 'WARN', '实例配置不完整', `${acc.name} 缺少 AK/SK/地域/实例 ID，已排除在调度之外`);
+      await sendTelegram(env, cfg, `⚠️ 【${acc.name} 配置不完整】`, [
+        ['状态', '缺少 AK/SK/地域/实例 ID'],
+        ['影响', '该实例不参与启停、保活与换班'],
+        ['处理', '到「设置」补全后自动恢复'],
+      ], '其他实例不受影响，继续按计划调度。');
+    }
   }
 
   // 启用了账单阈值但账号级账单查不出来的账号，fail-closed
@@ -1166,6 +1182,17 @@ async function runEngineCron(env, engine, preCfg, preState) {
     if (!groupAccounts.length) continue;
 
     const gSched = getGroupSchedule(state, group.id);
+
+    // 配置不完整的实例不参与选当班/轮换，但仍在面板显示；它不能阻塞同组其他实例
+    const active = groupAccounts.filter(isConfigured);
+    if (!active.length) {
+      gSched.dutyAccountId = null;
+      gSched.dutySince = 0;
+      gSched.transition = null;
+      gSched.startAttempt = null;
+      continue;
+    }
+
     const hasDdns = !!(group.cf && group.cf.enabled && group.cf.domainName && group.cf.apiToken);
     const rotationMinutes = num(group.rotationIntervalMinutes, 0);
 
@@ -1182,6 +1209,9 @@ async function runEngineCron(env, engine, preCfg, preState) {
       continue;
     }
 
+    // 当班实例的配置被清空：既不能保活，也不能安全换班，保持现状并跳过本组
+    if (gSched.dutyAccountId && !active.some((a) => a.id === gSched.dutyAccountId)) continue;
+
     // 若本组已在换班中，优先推进换班
     if (gSched.transition) {
       state.transition = gSched.transition;
@@ -1190,7 +1220,7 @@ async function runEngineCron(env, engine, preCfg, preState) {
 
     // 若未开启定时轮换，优先检查是否应由用户指定的主实例（未耗尽）当班
     if (rotationMinutes <= 0 && group.primaryAccountId) {
-      const preferred = groupAccounts.find((a) => {
+      const preferred = active.find((a) => {
         if (a.id !== group.primaryAccountId) return false;
         const st = state.accounts[a.id] || {};
         if (st.exhausted) return false;
@@ -1199,14 +1229,14 @@ async function runEngineCron(env, engine, preCfg, preState) {
       });
       // 如果当前当班机处于用户手动启动接管状态，且主实例未被显式启动，则不强行抢占当班
       const curDutySt = gSched.dutyAccountId ? (state.accounts[gSched.dutyAccountId] || {}) : null;
-      const curDutyAcc = groupAccounts.find((x) => x.id === gSched.dutyAccountId);
+      const curDutyAcc = active.find((x) => x.id === gSched.dutyAccountId);
       const curDutyMo = (curDutySt && curDutyAcc) ? refreshManualOverride(curDutySt, curDutyAcc, now) : null;
       const curDutyIsManualStart = curDutyMo?.action === 'start';
 
       if (preferred && gSched.dutyAccountId !== preferred.id && !curDutyIsManualStart) {
         gSched.dutyAccountId = preferred.id;
         gSched.dutySince = Date.now();
-        gSched.rotationIndex = groupAccounts.findIndex((a) => a.id === preferred.id);
+        gSched.rotationIndex = active.findIndex((a) => a.id === preferred.id);
         if (group.id === groups[0].id) {
           state.dutyAccountId = preferred.id;
           state.dutySince = gSched.dutySince;
@@ -1225,7 +1255,7 @@ async function runEngineCron(env, engine, preCfg, preState) {
       }
     }
 
-    let duty = groupAccounts.find((a) => a.id === gSched.dutyAccountId);
+    let duty = active.find((a) => a.id === gSched.dutyAccountId);
     if (!duty) {
       // 优先看是否配置了主实例（且未耗尽且未被手动关机），否则取第 1 个符合条件的实例
       const isEligible = (a) => {
@@ -1235,11 +1265,11 @@ async function runEngineCron(env, engine, preCfg, preState) {
         return mo?.action !== 'stop';
       };
       const preferred = group.primaryAccountId
-        ? groupAccounts.find((a) => a.id === group.primaryAccountId && isEligible(a))
+        ? active.find((a) => a.id === group.primaryAccountId && isEligible(a))
         : null;
-      const first = preferred || groupAccounts.find(isEligible);
+      const first = preferred || active.find(isEligible);
       if (!first) {
-        const allExhausted = groupAccounts.every((a) => state.accounts[a.id]?.exhausted);
+        const allExhausted = active.every((a) => state.accounts[a.id]?.exhausted);
         if (allExhausted && gSched.fusedMonth !== state.month) {
           gSched.fusedMonth = state.month;
           await engine.saveState(state);
@@ -1256,7 +1286,7 @@ async function runEngineCron(env, engine, preCfg, preState) {
       duty = first;
       gSched.dutyAccountId = first.id;
       gSched.dutySince = Date.now();
-      gSched.rotationIndex = groupAccounts.findIndex((a) => a.id === first.id);
+      gSched.rotationIndex = active.findIndex((a) => a.id === first.id);
       await engine.saveState(state);
       await appendLogSafe(env, 'AUDIT', `[${group.name}] 设定当班实例`, first.name);
     }
@@ -1268,7 +1298,7 @@ async function runEngineCron(env, engine, preCfg, preState) {
 
     if (needRotation) {
       const reason = dutyState?.exhausted ? `额度耗尽（${dutyState.reason}）` : '定时轮换到期';
-      const next = pickNextDuty(cfg, state, duty.id, groupAccounts, gSched.rotationIndex, now);
+      const next = pickNextDuty(cfg, state, duty.id, active, gSched.rotationIndex, now);
       if (!next) {
         const fRes = await fuseAndStopDuty(env, cfg, state, engine, duty, reason, group);
         syncLegacyStateView(state, cfg);
@@ -1316,7 +1346,8 @@ async function runEngineCron(env, engine, preCfg, preState) {
 async function keepAliveDuty(env, cfg, state, engine, duty, dutyState, now, group = null) {
   const gSched = group ? getGroupSchedule(state, group.id) : state;
   if (!isConfigured(duty)) {
-    return setFault(env, engine, state, 'ACCOUNT_NOT_CONFIGURED', `${duty.name} 缺少 AK/SK/地域/实例 ID`);
+    // 配置不完整的实例不参与调度，也不应拖停其他实例
+    return { ok: true, skipped: true, reason: 'unconfigured', duty: duty.id };
   }
 
   const desc = await describeEcs(duty);
@@ -1757,6 +1788,14 @@ async function executeCron(env) {
 async function tryAutoClearFault(env, cfg, state, engine) {
   const fault = state.fault;
   if (!fault) return false;
+
+  // 半配置实例已改为“排除在调度之外”，该故障码不再产生；旧故障直接解除
+  if (fault.code === 'ACCOUNT_NOT_CONFIGURED') {
+    state.fault = null;
+    await engine.saveState(state);
+    await appendLogSafe(env, 'AUDIT', '自动解除保护', '半配置实例已改为排除调度，ACCOUNT_NOT_CONFIGURED 不再适用');
+    return true;
+  }
 
   // 账单故障：阈值已关闭就自愈；仍开启则现场重查一次，成功即解除
   if (fault.code === 'BILL_QUERY_FAILED') {
@@ -2535,7 +2574,7 @@ let draggedInstId = null;
 
 const FAULT_HINTS = {
   INSTANCE_NOT_FOUND: '实例已被释放或实例 ID 不正确。请到「设置」删除该实例或改成正确的实例 ID，然后点下面的按钮。',
-  ACCOUNT_NOT_CONFIGURED: '实例缺少 AK/SK/地域/实例 ID。请到「设置」补全后重试。',
+  ACCOUNT_NOT_CONFIGURED: '实例缺少 AK/SK/地域/实例 ID。半配置实例现在只从调度中排除，不会熔断其他实例；这条历史故障会在下一轮巡检自动解除。',
   CONFIG_INVALID: '配置参数不合法。请到「设置」修正后重试。',
   CDT_QUERY_FAILED: '流量查询失败。检查 AccessKey 是否有 cdt:ListCdtInternetTraffic 权限。',
   BILL_QUERY_FAILED: '账单查询失败。检查 bss:DescribeInstanceBill 权限，或把账单阈值设为 0 关掉这项判定。',
@@ -2723,7 +2762,7 @@ function renderCardHtml(a){
     +     '<span class="px-2 py-0.5 rounded-full text-[10px] font-bold ' + statusStyle(status) + '">' + esc(status) + '</span>'
     +   '</div>'
     + '</div>'
-    + (!a.configured ? '<p class="text-[10px] text-amber-600 font-bold">未配置完整（缺 AK/SK/地域/实例 ID）</p>' : '')
+    + (!a.configured ? '<p class="text-[10px] text-amber-600 font-bold">未配置完整（缺 AK/SK/地域/实例 ID）· 未纳入调度</p>' : '')
     + (a.ecsError ? '<p class="text-[10px] text-rose-600">' + esc(a.ecsError) + '</p>' : '')
     + '<div>'
     +   '<div class="flex justify-between text-[11px] mb-1"><span class="text-zinc-500">流量</span><span class="font-bold text-zinc-800">' + (a.trafficGb ?? '-') + ' / ' + a.quota + ' GB（限额）</span></div>'
