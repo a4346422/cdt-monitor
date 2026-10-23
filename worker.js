@@ -23,6 +23,8 @@
 
 const TZ = 'Asia/Shanghai';
 const REQUEST_TIMEOUT_MS = 10000;
+// BSS（账单/余额）接口普遍比 ECS/CDT 慢，单独给更长的超时，避免 10s 就判失败
+const BSS_TIMEOUT_MS = 25000;
 const RETRY_ATTEMPTS = 3;
 
 // CDT 免费额度按地域类别分成两个独立池
@@ -202,7 +204,7 @@ function isSuccessCode(code) {
   return c === '' || c === 'ok' || c === '200' || c === 'success';
 }
 
-async function callAliyunOnce(host, region, params, ak, sk) {
+async function callAliyunOnce(host, region, params, ak, sk, timeoutMs = REQUEST_TIMEOUT_MS) {
   if (!ak || !sk) throw new AliyunError('AccessKey 未配置');
   const all = {
     Format: 'JSON',
@@ -229,7 +231,7 @@ async function callAliyunOnce(host, region, params, ak, sk) {
       method: 'POST',
       headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
       body: form.toString(),
-      signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+      signal: AbortSignal.timeout(timeoutMs),
     });
   } catch (e) {
     throw new AliyunError(`网络错误: ${e.message}`, { retryable: true });
@@ -256,11 +258,11 @@ async function callAliyunOnce(host, region, params, ak, sk) {
   return data;
 }
 
-async function callAliyun(host, region, params, ak, sk) {
+async function callAliyun(host, region, params, ak, sk, timeoutMs = REQUEST_TIMEOUT_MS) {
   let last;
   for (let attempt = 0; attempt < RETRY_ATTEMPTS; attempt++) {
     try {
-      return await callAliyunOnce(host, region, params, ak, sk);
+      return await callAliyunOnce(host, region, params, ak, sk, timeoutMs);
     } catch (e) {
       last = e;
       if (!(e instanceof AliyunError) || !e.retryable || attempt === RETRY_ATTEMPTS - 1) throw e;
@@ -415,7 +417,7 @@ async function queryBill(acc, { cycle, instanceId, hideZero, maxPages = 5 } = {}
     if (hideZero) params.IsHideZeroCharge = true;
     if (token) params.NextToken = token;
 
-    const res = await callAliyun(bss.host, bss.region, params, acc.ak, acc.sk);
+    const res = await callAliyun(bss.host, bss.region, params, acc.ak, acc.sk, BSS_TIMEOUT_MS);
     const data = res.Data || {};
     let rows = data.Items?.Item || data.Items || [];
     if (!Array.isArray(rows)) rows = [rows];
@@ -471,7 +473,7 @@ async function getAccountBalance(acc) {
     const res = await callAliyun(bss.host, bss.region, {
       Action: 'QueryAccountBalance',
       Version: '2017-12-14',
-    }, acc.ak, acc.sk);
+    }, acc.ak, acc.sk, BSS_TIMEOUT_MS);
     const data = res.Data || {};
     if (data.AvailableAmount == null) throw new Error('余额响应缺少 AvailableAmount');
     return {
@@ -485,15 +487,22 @@ async function getAccountBalance(acc) {
 }
 
 // EIP 列表：绑定状态、计费方式、绑到哪个实例。闲置（Available）的 EIP 会按小时计保有费。
+// DescribeEips 属于 VPC API（Version 2016-04-28，分页用 PageNumber/PageSize），
+// 不是 ECS 2014-05-26 的接口，用 ECS 端点会返回 InvalidAction.NotFound。
 async function listEips(acc) {
   try {
     const eips = [];
-    let token = '';
-    let pages = 0;
+    let page = 1;
+    let total = null;
     do {
-      const params = { Action: 'DescribeEips', Version: '2014-05-26', MaxResults: 100 };
-      if (token) params.NextToken = token;
-      const res = await callAliyun(`ecs.${acc.regionId}.aliyuncs.com`, acc.regionId, params, acc.ak, acc.sk);
+      const params = {
+        Action: 'DescribeEips',
+        Version: '2016-04-28',
+        RegionId: acc.regionId,
+        PageNumber: page,
+        PageSize: 100,
+      };
+      const res = await callAliyun(`vpc.${acc.regionId}.aliyuncs.com`, acc.regionId, params, acc.ak, acc.sk);
       let rows = res.Eips?.Eip || res.Eips || [];
       if (!Array.isArray(rows)) rows = [rows];
       for (const e of rows) {
@@ -508,9 +517,10 @@ async function listEips(acc) {
           name: e?.Name || '',
         });
       }
-      token = res.NextToken || '';
-      pages++;
-    } while (token && pages < 5);
+      if (res.TotalCount != null) total = Number(res.TotalCount);
+      if (!rows.length || (total != null && eips.length >= total)) break;
+      page++;
+    } while (page <= 5);
     return { ok: true, count: eips.length, idle: eips.filter((e) => e.status === 'Available').length, eips };
   } catch (e) {
     return { ok: false, error: e.message, code: e.code || null };
@@ -1048,16 +1058,25 @@ async function runEngineCron(env, engine, preCfg, preState) {
   const billDue = Date.now() - num(state.lastBillCheck, 0) >= num(cfg.system.billCheckMinutes, 30) * 60000;
   const bills = {};
   if (billDue && cfg.accounts.length) {
-    const results = await Promise.all(cfg.accounts.map(async (acc) => {
-      const [account, instance, balance] = await Promise.all([
-        queryBillSafe(acc, { cycle: now.month }),
-        queryBillSafe(acc, { cycle: now.month, instanceId: acc.instanceId }),
-        getAccountBalance(acc),
-      ]);
-      return { account, instance, balance };
-    }));
-    cfg.accounts.forEach((acc, i) => { bills[acc.id] = results[i]; });
+    // 串行查询：BSS 对并发很敏感，3N 并发容易排队到超时
+    for (const acc of cfg.accounts) {
+      if (!isConfigured(acc)) continue;
+      const account = await queryBillSafe(acc, { cycle: now.month });
+      const instance = await queryBillSafe(acc, { cycle: now.month, instanceId: acc.instanceId });
+      const balance = await getAccountBalance(acc);
+      bills[acc.id] = { account, instance, balance };
+    }
     state.lastBillCheck = Date.now();
+    const billFailures = cfg.accounts
+      .filter((a) => bills[a.id]?.account && !bills[a.id].account.ok)
+      .map((a) => `${a.name}: ${bills[a.id].account.error || '账单不可用'}`);
+    // 记录本轮结果：面板和故障自愈都靠它，不再被下一轮“未查询”覆盖
+    state.lastBillAttempt = {
+      at: Date.now(),
+      ok: billFailures.length === 0,
+      error: billFailures.join('; ') || null,
+    };
+    if (billFailures.length) await appendLogSafe(env, 'WARN', '账单查询失败', billFailures.join('; '));
   }
 
   // ---- 汇总每账号状态
@@ -1078,7 +1097,8 @@ async function runEngineCron(env, engine, preCfg, preState) {
       billInstanceAmount: instBill ? (instBill.ok ? instBill.amount : prev.billInstanceAmount ?? null) : (prev.billInstanceAmount ?? null),
       billCurrency: acctBill?.ok ? acctBill.currency : (instBill?.ok ? instBill.currency : (prev.billCurrency ?? null)),
       billOk: acctBill ? acctBill.ok : (prev.billOk ?? false),
-      billError: acctBill && !acctBill.ok ? acctBill.error : null,
+      // 本轮没查账单时保留上次的错误，否则面板只剩“金额 + 无错误”看不出问题
+      billError: acctBill ? (acctBill.ok ? null : acctBill.error) : (prev.billError ?? null),
       balance: b?.balance ? (b.balance.ok ? b.balance.balance : (prev.balance ?? null)) : (prev.balance ?? null),
       balanceCurrency: b?.balance?.ok ? b.balance.currency : (prev.balanceCurrency ?? null),
       balanceOk: b?.balance ? b.balance.ok : (prev.balanceOk ?? false),
@@ -1093,7 +1113,7 @@ async function runEngineCron(env, engine, preCfg, preState) {
   const billFailures = cfg.accounts
     .filter((a) => resolveBillThreshold(a, cfg) > 0)
     .filter((a) => state.accounts[a.id]?.billOk === false)
-    .map((a) => `${a.name}: ${state.accounts[a.id].billError || '账单不可用'}`);
+    .map((a) => `${a.name}: ${state.accounts[a.id].billError || state.lastBillAttempt?.error || '账单不可用'}`);
   if (billFailures.length) {
     return setFault(env, engine, state, 'BILL_QUERY_FAILED', billFailures.join('; '));
   }
@@ -1701,6 +1721,46 @@ async function executeCron(env) {
 async function tryAutoClearFault(env, cfg, state, engine) {
   const fault = state.fault;
   if (!fault) return false;
+
+  // 账单故障：阈值已关闭就自愈；仍开启则现场重查一次，成功即解除
+  if (fault.code === 'BILL_QUERY_FAILED') {
+    const targets = cfg.accounts.filter((a) => isConfigured(a) && resolveBillThreshold(a, cfg) > 0);
+    if (!targets.length) {
+      state.fault = null;
+      await engine.saveState(state);
+      await appendLogSafe(env, 'AUDIT', '自动解除保护', '账单阈值已关闭，BILL_QUERY_FAILED 不再适用');
+      return true;
+    }
+    const now = bjNow();
+    const results = [];
+    for (const acc of targets) results.push({ acc, bill: await queryBillSafe(acc, { cycle: now.month }) });
+    const failed = results.filter((r) => !r.bill.ok);
+    if (failed.length) {
+      state.lastBillAttempt = {
+        at: Date.now(),
+        ok: false,
+        error: failed.map((r) => `${r.acc.name}: ${r.bill.error || '账单不可用'}`).join('; '),
+      };
+      await engine.saveState(state);
+      return false;
+    }
+    for (const { acc, bill } of results) {
+      state.accounts = state.accounts || {};
+      state.accounts[acc.id] = {
+        ...(state.accounts[acc.id] || {}),
+        billAmount: bill.amount,
+        billCurrency: bill.currency,
+        billOk: true,
+        billError: null,
+      };
+    }
+    state.lastBillAttempt = { at: Date.now(), ok: true, error: null };
+    state.fault = null;
+    await engine.saveState(state);
+    await appendLogSafe(env, 'AUDIT', '自动解除保护', '账单查询已恢复，BILL_QUERY_FAILED 自动清除');
+    return true;
+  }
+
   if (fault.code !== 'INSTANCE_NOT_FOUND') return false;
   // 触发故障的那个实例还在配置里 → 不能自愈
   if (fault.accountId && cfg.accounts.some((a) => a.id === fault.accountId)) return false;
@@ -2633,6 +2693,7 @@ function renderCardHtml(a){
           + '<div class="h-1.5 rounded-full bg-zinc-200 overflow-hidden"><div class="h-full ' + barColor(bp) + '" style="width:' + bp + '%"></div></div>'
           + '</div>'
         : row('账单（账号级）', money(a.billAccountAmount, cur)))
+    + (a.billError ? '<p class="text-[10px] text-rose-600">账单查询失败：' + esc(a.billError) + '</p>' : '')
     + row('该实例费用', money(a.billInstanceAmount, cur))
     + row('账户余额', a.balanceOk ? money(a.balance, a.balanceCurrency || cur) : (a.configured ? '查询失败' : '-'))
     + row('公网 IP', a.ecsEip
