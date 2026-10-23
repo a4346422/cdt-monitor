@@ -87,7 +87,7 @@ globalThis.fetch = async (url, init) => {
       if (start + pageSize < filtered.length) data.NextToken = String(start + pageSize);
       return json({ Data: data });
     }
-    if (action === 'DescribeEips') {
+    if (action === 'DescribeEips' || action === 'DescribeEipAddresses') {
       if (world.eipsError) return json({ Code: 'NoPermission', Message: 'You are not authorized to perform this operation.' });
       const list = world.eips[ak] || [];
       return json({ Eips: { Eip: list }, TotalCount: list.length });

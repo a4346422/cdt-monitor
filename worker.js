@@ -491,14 +491,11 @@ async function getAccountBalance(acc) {
 // 所以按候选顺序逐个试（每个只试一次，不重试），命中即用并把 endpoint 回报出来。
 function eipCandidates(acc) {
   const r = acc.regionId;
-  const list = [
-    { host: `vpc.${r}.aliyuncs.com`, version: '2016-04-28', action: 'DescribeEips' },
+  return [
+    // 国际站实测：DescribeEipAddresses 存在，DescribeEips 返回 InvalidAction.NotFound
     { host: `vpc.${r}.aliyuncs.com`, version: '2016-04-28', action: 'DescribeEipAddresses' },
-    { host: 'vpc.ap-southeast-1.aliyuncs.com', version: '2016-04-28', action: 'DescribeEips' },
-    { host: 'vpc.ap-southeast-1.aliyuncs.com', version: '2016-04-28', action: 'DescribeEipAddresses' },
-    { host: `ecs.${r}.aliyuncs.com`, version: '2014-05-26', action: 'DescribeEipAddresses' },
+    { host: `vpc.${r}.aliyuncs.com`, version: '2016-04-28', action: 'DescribeEips' },
   ];
-  return acc.siteType === 'international' ? list : list.slice(0, 2);
 }
 
 async function listEips(acc) {
@@ -542,6 +539,15 @@ async function listEips(acc) {
     } catch (e) {
       attempts.push({ host: ep.host, version: ep.version, action: ep.action, error: e.message, code: e.code || null });
     }
+  }
+  const denied = attempts.find((a) => a.code === 'Forbidden.RAM');
+  if (denied) {
+    return {
+      ok: false,
+      error: `缺少 VPC 读权限：给该 AK 加 vpc:DescribeEipAddresses（如 AliyunVPCReadOnlyAccess）。原始错误：${denied.error}`,
+      code: denied.code,
+      attempts,
+    };
   }
   return { ok: false, error: attempts[0]?.error || 'EIP 查询失败', code: attempts[0]?.code || null, attempts };
 }
