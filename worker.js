@@ -936,6 +936,12 @@ function syncLegacyStateView(state, cfg) {
   state.fusedMonth = gSched.fusedMonth;
 }
 
+// 分组内参与调度的实例：配置不完整的不参与选当班/轮换/换班。
+// rotationIndex 必须相对这个集合计算，否则会与 pickNextDuty 的池子错位。
+function groupActiveAccounts(cfg, groupId) {
+  return cfg.accounts.filter((a) => (a.groupId || 'group-default') === groupId && isConfigured(a));
+}
+
 // 按 round-robin 顺序取下一个候选（支持组内或全局）
 function pickNextDuty(cfg, state, excludeId, targetAccounts = null, rotationIndex = 0, now = bjNow()) {
   const pool = targetAccounts || cfg.accounts;
@@ -1210,7 +1216,8 @@ async function runEngineCron(env, engine, preCfg, preState) {
     }
 
     // 当班实例的配置被清空：既不能保活，也不能安全换班，保持现状并跳过本组
-    if (gSched.dutyAccountId && !active.some((a) => a.id === gSched.dutyAccountId)) continue;
+    // （若已有换班在推进，仍让它跑完，避免 DNS 已切而旧机一直计费）
+    if (!gSched.transition && gSched.dutyAccountId && !active.some((a) => a.id === gSched.dutyAccountId)) continue;
 
     // 若本组已在换班中，优先推进换班
     if (gSched.transition) {
@@ -1684,12 +1691,11 @@ async function advanceTransition(env, cfg, state, engine, now) {
 async function finishTransition(env, cfg, state, engine, target, off, tr) {
   const grpId = tr.groupId || target.groupId || 'group-default';
   const grp = findGroup(cfg, grpId);
-  const grpAccounts = cfg.accounts.filter((a) => (a.groupId || 'group-default') === grpId);
 
   const gSched = getGroupSchedule(state, grpId);
   gSched.dutyAccountId = target.id;
   gSched.dutySince = Date.now();
-  gSched.rotationIndex = grpAccounts.findIndex((a) => a.id === target.id);
+  gSched.rotationIndex = groupActiveAccounts(cfg, grpId).findIndex((a) => a.id === target.id);
   gSched.transition = null;
   gSched.startAttempt = null;
   state.transition = null;
@@ -1876,18 +1882,17 @@ async function reconcileAndClearFault(env, cfg, state, engine) {
     if (target && off) {
       const [a, b] = await Promise.all([describeEcs(target), describeEcs(off)]);
       if (a.ok && a.status === 'Running' && (isStopChargingConfirmed(b) || b.status === 'NotFound')) {
+        const grpId = tr.groupId || target.groupId || 'group-default';
         state.dutyAccountId = target.id;
         state.dutySince = Date.now();
-        state.rotationIndex = cfg.accounts.findIndex((x) => x.id === target.id);
+        state.rotationIndex = groupActiveAccounts(cfg, grpId).findIndex((x) => x.id === target.id);
         state.transition = null;
         state.startAttempt = null;
 
-        const grpId = tr.groupId || target.groupId || 'group-default';
-        const grpAccounts = cfg.accounts.filter((a) => (a.groupId || 'group-default') === grpId);
         const gSched = getGroupSchedule(state, grpId);
         gSched.dutyAccountId = target.id;
         gSched.dutySince = Date.now();
-        gSched.rotationIndex = grpAccounts.findIndex((x) => x.id === target.id);
+        gSched.rotationIndex = groupActiveAccounts(cfg, grpId).findIndex((x) => x.id === target.id);
         gSched.transition = null;
         gSched.startAttempt = null;
 
@@ -2138,8 +2143,7 @@ export default {
               if (!gSched.dutyAccountId) {
                 gSched.dutyAccountId = acc.id;
                 gSched.dutySince = Date.now();
-                const grpAccs = cfg.accounts.filter((x) => (x.groupId || 'group-default') === group.id);
-                gSched.rotationIndex = grpAccs.findIndex((x) => x.id === acc.id);
+                gSched.rotationIndex = groupActiveAccounts(cfg, group.id).findIndex((x) => x.id === acc.id);
               }
             }
             return st;
@@ -2161,8 +2165,7 @@ export default {
           if (isDdnsGroup && group) {
             const gSched = getGroupSchedule(state, group.id);
             if (gSched.dutyAccountId === acc.id) {
-              const groupAccounts = cfg.accounts.filter((a) => (a.groupId || 'group-default') === group.id);
-              const next = pickNextDuty(cfg, state, acc.id, groupAccounts, gSched.rotationIndex, now);
+              const next = pickNextDuty(cfg, state, acc.id, groupActiveAccounts(cfg, group.id), gSched.rotationIndex, now);
               if (next) {
                 await appendLogSafe(env, 'AUDIT', `[${group.name}] 手动停机切班`, `${acc.name} -> ${next.acc.name}`);
                 state.accounts = state.accounts || {};

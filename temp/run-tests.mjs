@@ -553,6 +553,44 @@ console.log('\n[9] fail-closed');
 }
 
 {
+  // 换班实际已完成时，人工清故障应确认完成而不是崩溃（曾引用未定义变量）
+  resetWorld();
+  const accounts = [acc('a'), acc('b')];
+  seed(accounts, 'i-b');            // b 在跑，a 已节省停机
+  const cfg = baseConfig(accounts);
+  const env = makeEnv(cfg);
+  const st = { ...defaultState(), month: cstMonth(), dutyAccountId: 'a', dutySince: Date.now() };
+  st.fault = { code: 'TRANSITION_TIMEOUT', at: new Date().toISOString(), message: 'x', accountId: null };
+  st.transition = { targetId: 'b', offId: 'a', groupId: 'group-default', step: 'WAIT_STOP', startedAt: Date.now() };
+  const eng = makeEngine(st);
+  const r = await reconcileAndClearFault(env, cfg, st, eng);
+  check('换班已完成时清故障不崩溃', r.ok === true && r.cleared === true, r);
+  check('清故障后当班切到目标实例', st.dutyAccountId === 'b', st.dutyAccountId);
+  check('清故障后 rotationIndex 相对 active 集合', st.groups['group-default'].rotationIndex === 1, st.groups['group-default'].rotationIndex);
+}
+
+{
+  // 当班实例的配置被清空：保持原当班标记，不误切 DNS、不误拉起其他实例
+  resetWorld();
+  const accounts = [acc('a', { ak: '', sk: '' }), acc('b')];
+  accounts.forEach((x) => { x.groupId = 'group-ddns'; });
+  seed(accounts, 'i-b');
+  const cfg = baseConfig(accounts);
+  cfg.groups = [
+    { id: 'group-ddns', name: 'DDNS 组', rotationIntervalMinutes: 0,
+      cf: { enabled: true, apiToken: 'tok', zoneId: 'z', recordId: 'r', domainName: 'x.example.com' } },
+  ];
+  const env = makeEnv(cfg);
+  const st = { ...defaultState(), month: cstMonth() };
+  st.groups = { 'group-ddns': { dutyAccountId: 'a', dutySince: Date.now(), rotationIndex: 0, transition: null, startAttempt: null } };
+  const eng = makeEngine(st);
+  await runEngineCron(env, eng);
+  check('当班实例半配置时保持原当班标记', st.groups['group-ddns'].dutyAccountId === 'a', st.groups['group-ddns']);
+  check('当班实例半配置时不更新 DNS', world.dns.content === '1.1.1.1', world.dns);
+  check('当班实例半配置时不拉起其他实例', world.startCalls.length === 0, world.startCalls);
+}
+
+{
   // 未到账单周期时保留上次的错误，而不是清成 null
   resetWorld();
   const accounts = [acc('a')];
