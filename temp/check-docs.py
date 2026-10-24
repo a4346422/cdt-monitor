@@ -15,11 +15,13 @@ def eq(label, a, b):
 # ---------- 1. 故障码 ----------
 code_codes = set(re.findall(r"setFault\(env, engine, state, '([A-Z_]+)'", src))
 doc_codes = set(re.findall(r'^\| `([A-Z_]{4,})` \|', readme, re.M))
-eq('README 故障码集合', sorted(code_codes), sorted(doc_codes))
+# README 里明确标注为「历史故障码、代码已不再产生」的项：保留文档供排障参考，不参与集合比对
+HISTORICAL_CODES = {'ACCOUNT_NOT_CONFIGURED'}
+eq('README 故障码集合', sorted(code_codes), sorted(doc_codes - HISTORICAL_CODES))
 
 # 部署清单只列常见故障，但列出的必须真实存在
 dep_codes = set(re.findall(r'`([A-Z_]{6,})`', deploy)) & code_codes
-unknown = set(re.findall(r'^\| `([A-Z_]{6,})` \|', deploy, re.M)) - code_codes
+unknown = set(re.findall(r'^\| `([A-Z_]{6,})` \|', deploy, re.M)) - code_codes - HISTORICAL_CODES
 if unknown:
     fails.append(f'部署清单列了代码里不存在的故障码: {sorted(unknown)}')
 
