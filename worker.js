@@ -115,6 +115,7 @@ function defaultState() {
     lastBillAttempt: null,   // { at, ok, error, skipped } 上一轮账单查询的真实结果
     lastTrafficCheck: null,
     fault: null,
+    lastFaultClearNotify: null,  // { code, at } 解除保护通知节流标记
     dailyReportDate: null,
   };
 }
@@ -676,7 +677,7 @@ function formatTg(title, items, summary) {
   return lines.join('\n');
 }
 
-async function sendTelegram(env, cfg, title, items, summary) {
+async function sendTelegram(env, cfg, title, items, summary, timeoutMs = REQUEST_TIMEOUT_MS) {
   const tg = cfg.notify?.tg || {};
   if (!tg.enabled || !tg.botToken || !tg.chatId) return { ok: false, skipped: true };
   try {
@@ -684,7 +685,7 @@ async function sendTelegram(env, cfg, title, items, summary) {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ chat_id: tg.chatId, text: formatTg(title, items, summary), parse_mode: 'Markdown' }),
-      signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+      signal: AbortSignal.timeout(timeoutMs),
     });
     const data = await res.json();
     if (!data.ok) throw new Error(data.description || `HTTP ${res.status}`);
@@ -694,6 +695,36 @@ async function sendTelegram(env, cfg, title, items, summary) {
     try { await appendLog(env, 'ERROR', 'Telegram 发送失败', `${title}: ${e.message}`); } catch { /* ignore */ }
     return { ok: false, error: e.message };
   }
+}
+
+// 同一错误码 10 分钟内只通知一次，避免网络抖动导致的反复解除刷屏
+const FAULT_CLEAR_NOTIFY_THROTTLE_MS = 10 * 60 * 1000;
+
+function markFaultClearNotify(state, code) {
+  state.lastFaultClearNotify = { code: code || 'UNKNOWN', at: Date.now() };
+}
+
+// 保护状态解除通知：Markdown 特殊字符先清掉，超时 5 秒，失败只落日志不影响主流程
+async function notifyFaultCleared(env, cfg, prevFault, how, notes) {
+  if (!prevFault) return { ok: false, skipped: true, reason: 'no_fault' };
+  const safe = (v) => String(v == null || v === '' ? '-' : v).replace(/([_*`\[\]])/g, '\\$1');
+  const startedAt = prevFault.at ? new Date(prevFault.at) : null;
+  const mins = startedAt && !Number.isNaN(startedAt.getTime())
+    ? Math.max(0, Math.round((Date.now() - startedAt.getTime()) / 60000)) : null;
+  const items = [
+    ['原错误码', safe(prevFault.code)],
+    ['故障详情', safe(prevFault.message)],
+    ['进入保护', safe(prevFault.at)],
+    ['持续时长', mins == null ? '-' : `${mins} 分钟`],
+    ['解除方式', safe(how)],
+    ['解除时间', safe(bjNow().iso)],
+  ];
+  if (notes) items.push(['对账结果', safe(notes)]);
+  const r = await sendTelegram(env, cfg, '✅ 【保护状态已解除】', items, '自动调度已恢复。', 5000);
+  if (r.ok) {
+    try { await appendLog(env, 'AUDIT', '保护状态解除通知', `${prevFault.code} → ${how}`); } catch { /* ignore */ }
+  }
+  return r;
 }
 
 // ============================================================================
@@ -1846,22 +1877,29 @@ async function tryAutoClearFault(env, cfg, state, engine) {
   const fault = state.fault;
   if (!fault) return false;
 
-  // 半配置实例已改为“排除在调度之外”，该故障码不再产生；旧故障直接解除
-  if (fault.code === 'ACCOUNT_NOT_CONFIGURED') {
+  // 统一解除入口：一次落盘（含通知节流标记），再发 TG
+  const clear = async (reason) => {
+    const prev = { ...fault };
+    const last = state.lastFaultClearNotify;
+    const throttled = !!(last && last.code === prev.code && Date.now() - num(last.at, 0) < FAULT_CLEAR_NOTIFY_THROTTLE_MS);
+    if (!throttled) markFaultClearNotify(state, prev.code);
     state.fault = null;
     await engine.saveState(state);
-    await appendLogSafe(env, 'AUDIT', '自动解除保护', '半配置实例已改为排除调度，ACCOUNT_NOT_CONFIGURED 不再适用');
+    await appendLogSafe(env, 'AUDIT', '自动解除保护', reason);
+    if (!throttled) await notifyFaultCleared(env, cfg, prev, '自动自愈', reason);
     return true;
+  };
+
+  // 半配置实例已改为“排除在调度之外”，该故障码不再产生；旧故障直接解除
+  if (fault.code === 'ACCOUNT_NOT_CONFIGURED') {
+    return clear('半配置实例已改为排除调度，ACCOUNT_NOT_CONFIGURED 不再适用');
   }
 
   // 账单故障：阈值已关闭就自愈；仍开启则现场重查一次，成功即解除
   if (fault.code === 'BILL_QUERY_FAILED') {
     const targets = cfg.accounts.filter((a) => isConfigured(a) && resolveBillThreshold(a, cfg) > 0);
     if (!targets.length) {
-      state.fault = null;
-      await engine.saveState(state);
-      await appendLogSafe(env, 'AUDIT', '自动解除保护', '账单阈值已关闭，BILL_QUERY_FAILED 不再适用');
-      return true;
+      return clear('账单阈值已关闭，BILL_QUERY_FAILED 不再适用');
     }
     const now = bjNow();
     const results = [];
@@ -1896,46 +1934,35 @@ async function tryAutoClearFault(env, cfg, state, engine) {
     state.lastBillAttempt = { at: Date.now(), ok: true, error: null, skipped: 0 };
     // 刚查过账号级账单，同步推进节流时间，避免同一轮再查一遍
     state.lastBillCheck = Date.now();
-    state.fault = null;
-    await engine.saveState(state);
-    await appendLogSafe(env, 'AUDIT', '自动解除保护', '账单查询已恢复，BILL_QUERY_FAILED 自动清除');
-    return true;
+    return clear('账单查询已恢复，BILL_QUERY_FAILED 自动清除');
   }
 
   // 流量故障：网络抖动也会落到这里。现场重查一次，成功即解除；仍失败则保持熔断。
   if (fault.code === 'CDT_QUERY_FAILED') {
     const targets = cfg.accounts.filter((a) => isConfigured(a));
     if (!targets.length) {
-      state.fault = null;
-      await engine.saveState(state);
-      await appendLogSafe(env, 'AUDIT', '自动解除保护', '没有已配置实例，CDT_QUERY_FAILED 不再适用');
-      return true;
+      return clear('没有已配置实例，CDT_QUERY_FAILED 不再适用');
     }
     const traffic = await Promise.all(targets.map((a) => getCdtTraffic(a)));
     const failed = [];
     targets.forEach((a, i) => { if (!traffic[i].ok) failed.push(`${a.name}: ${traffic[i].error}`); });
     // 仍失败：不写 KV，避免持续故障时每 2 分钟多一次写
     if (failed.length) return false;
-    state.fault = null;
-    await engine.saveState(state);
-    await appendLogSafe(env, 'AUDIT', '自动解除保护', '流量查询已恢复，CDT_QUERY_FAILED 自动清除');
-    return true;
+    return clear('流量查询已恢复，CDT_QUERY_FAILED 自动清除');
   }
 
   if (fault.code !== 'INSTANCE_NOT_FOUND') return false;
   // 触发故障的那个实例还在配置里 → 不能自愈
   if (fault.accountId && cfg.accounts.some((a) => a.id === fault.accountId)) return false;
 
-  state.fault = null;
-  await engine.saveState(state);
-  await appendLogSafe(env, 'AUDIT', '自动解除保护', '触发故障的实例已从配置中移除');
-  return true;
+  return clear('触发故障的实例已从配置中移除');
 }
 
 // 清故障：先按真实状态对账，再清
 async function reconcileAndClearFault(env, cfg, state, engine) {
   const notes = [];
   const code = state.fault?.code;
+  const prevFault = state.fault ? { ...state.fault } : null;
 
   // 熔断其实已经完成（所有账号都耗尽且当班已停机）
   const allExhausted = cfg.accounts.length > 0 && cfg.accounts.every((a) => state.accounts[a.id]?.exhausted);
@@ -1995,9 +2022,11 @@ async function reconcileAndClearFault(env, cfg, state, engine) {
   if (code === 'INSTANCE_NOT_FOUND') notes.push('实例缺失问题已解决');
 
   state.fault = null;
+  if (prevFault) markFaultClearNotify(state, prevFault.code);
   await engine.saveState(state);
   await appendLogSafe(env, 'AUDIT', '清除故障', notes.join('；') || '人工清除');
-  return { ok: true, cleared: true, notes, previousFault: code || null };
+  const notify = await notifyFaultCleared(env, cfg, prevFault, '人工清除（面板）', notes.join('；'));
+  return { ok: true, cleared: true, notes, previousFault: code || null, notify };
 }
 
 // ============================================================================
@@ -2738,7 +2767,15 @@ async function act(action){
       else if (r && r.error) toast('❌ ' + r.error, 'error');
       else toast('巡检完成（未返回摘要）', 'ok');
     } else if (r && r.cleared === false) toast('未能清除：' + (r.notes || []).join('；'), 'warn');
-    else if (r && r.cleared === true) toast('已清除保护状态。' + (r.notes || []).join('；'), 'ok');
+    else if (r && r.cleared === true) {
+      const nt = r.notify || {};
+      const tgMsg = nt.ok ? 'TG 通知已发送'
+        : nt.reason === 'no_fault' ? '原本无故障，未发通知'
+        : nt.reason === 'throttled' ? '10 分钟内已通知过，已节流'
+        : nt.skipped ? 'TG 未启用，未通知'
+        : 'TG 通知失败：' + (nt.error || '未知原因');
+      toast('已清除保护状态。' + (r.notes || []).join('；') + '｜' + tgMsg, 'ok');
+    }
     else if (r && r.halted) toast('🚨 已进入保护状态：' + (r.fault?.code || ''), 'error');
     else if (r && r.error) toast('❌ ' + r.error, 'error');
     else toast('操作已提交', 'info');

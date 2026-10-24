@@ -561,6 +561,62 @@ console.log('\n[9] fail-closed');
 }
 
 {
+  // 自动解除保护时发一条 TG；10 分钟内同一错误码重复解除不重复发
+  resetWorld();
+  const accounts = [acc('a')];
+  seed(accounts, 'i-a');
+  const cfg = baseConfig(accounts);
+  const env = makeEnv(cfg);
+  const st = { ...defaultState(), month: cstMonth(), dutyAccountId: 'a', dutySince: Date.now() };
+  st.fault = { code: 'ACCOUNT_NOT_CONFIGURED', at: new Date(Date.now() - 5 * 60000).toISOString(), message: 'x', accountId: 'a' };
+  const eng = makeEngine(st);
+  world.tg = [];
+  await runEngineCron(env, eng);
+  check('自动解除保护发 TG 通知', world.tg.some((t) => t.includes('保护状态已解除')), world.tg);
+  check('解除通知含原错误码与持续时长', world.tg.some((t) => t.includes('ACCOUNT\\_NOT\\_CONFIGURED') && t.includes('5 分钟')), world.tg);
+  check('解除后写入节流标记', st.lastFaultClearNotify?.code === 'ACCOUNT_NOT_CONFIGURED', st.lastFaultClearNotify);
+
+  // 10 分钟内再次故障并解除：节流，不重复发
+  st.fault = { code: 'ACCOUNT_NOT_CONFIGURED', at: new Date().toISOString(), message: 'x', accountId: 'a' };
+  world.tg = [];
+  await runEngineCron(env, eng);
+  check('10 分钟内重复解除被节流', st.fault === null && world.tg.length === 0, world.tg);
+}
+
+{
+  // 人工清故障也发 TG，并把结果回传给面板
+  resetWorld();
+  const accounts = [acc('a')];
+  seed(accounts, 'i-a');
+  const cfg = baseConfig(accounts);
+  const env = makeEnv(cfg);
+  const st = { ...defaultState(), month: cstMonth(), dutyAccountId: 'a', dutySince: Date.now() };
+  st.fault = { code: 'TRANSITION_TIMEOUT', at: new Date(Date.now() - 3 * 60000).toISOString(), message: '超时', accountId: null };
+  world.tg = [];
+  const r = await reconcileAndClearFault(env, cfg, st, makeEngine(st));
+  check('人工清故障返回 notify.ok', r.cleared === true && r.notify?.ok === true, r.notify);
+  check('人工清故障发出解除通知', world.tg.some((t) => t.includes('保护状态已解除') && t.includes('人工清除')), world.tg);
+
+  // 没有故障时点清除：不发通知
+  resetWorld();
+  seed(accounts, 'i-a');
+  world.tg = [];
+  const st2 = { ...defaultState(), month: cstMonth() };
+  const r2 = await reconcileAndClearFault(env, cfg, st2, makeEngine(st2));
+  check('无故障时点清除不发通知', r2.cleared === true && r2.notify?.reason === 'no_fault' && world.tg.length === 0, r2);
+
+  // TG 未启用：解除照常，通知跳过
+  resetWorld();
+  seed(accounts, 'i-a');
+  world.tg = [];
+  cfg.notify.tg.enabled = false;
+  const st3 = { ...defaultState(), month: cstMonth(), dutyAccountId: 'a', dutySince: Date.now() };
+  st3.fault = { code: 'TRANSITION_TIMEOUT', at: new Date().toISOString(), message: 'x', accountId: null };
+  const r3 = await reconcileAndClearFault(env, cfg, st3, makeEngine(st3));
+  check('TG 未启用时解除成功且通知跳过', r3.cleared === true && r3.notify?.skipped === true && world.tg.length === 0, r3.notify);
+}
+
+{
   // 换班实际已完成时，人工清故障应确认完成而不是崩溃（曾引用未定义变量）
   resetWorld();
   const accounts = [acc('a'), acc('b')];
