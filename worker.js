@@ -143,6 +143,19 @@ function bjNow() {
 
 function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
 
+// 把任意时间戳转成北京时间 YYYY-MM-DD HH:mm（通知里不用 UTC，避免误判）
+function bjTimeStr(v) {
+  const d = v instanceof Date ? v : new Date(v);
+  if (Number.isNaN(d.getTime())) return '-';
+  const p = Object.fromEntries(
+    new Intl.DateTimeFormat('en-CA', {
+      timeZone: TZ, year: 'numeric', month: '2-digit', day: '2-digit',
+      hour: '2-digit', minute: '2-digit', hour12: false,
+    }).formatToParts(d).map((x) => [x.type, x.value]),
+  );
+  return `${p.year}-${p.month}-${p.day} ${p.hour}:${p.minute}`;
+}
+
 function normalizeHHMM(v, def = '00:00') {
   if (!v || typeof v !== 'string') return def;
   const parts = v.trim().split(':');
@@ -700,18 +713,25 @@ async function sendTelegram(env, cfg, title, items, summary, timeoutMs = REQUEST
 async function notifyFaultCleared(env, cfg, prevFault, how, notes) {
   if (!prevFault) return { ok: false, skipped: true, reason: 'no_fault' };
   const safe = (v) => String(v == null || v === '' ? '-' : v).replace(/([_*`\[\]])/g, '\\$1');
+  const trunc = (v, n) => {
+    const s = String(v == null || v === '' ? '-' : v);
+    return s.length > n ? `${s.slice(0, n)}…` : s;
+  };
   const startedAt = prevFault.at ? new Date(prevFault.at) : null;
-  const mins = startedAt && !Number.isNaN(startedAt.getTime())
-    ? Math.max(0, Math.round((Date.now() - startedAt.getTime()) / 60000)) : null;
+  const elapsed = startedAt && !Number.isNaN(startedAt.getTime())
+    ? Math.max(0, Date.now() - startedAt.getTime()) : null;
+  const duration = elapsed == null
+    ? '-'
+    : (elapsed < 60000 ? `${Math.max(1, Math.round(elapsed / 1000))} 秒` : `${Math.round(elapsed / 60000)} 分钟`);
   const items = [
     ['原错误码', safe(prevFault.code)],
-    ['故障详情', safe(prevFault.message)],
-    ['进入保护', safe(prevFault.at)],
-    ['持续时长', mins == null ? '-' : `${mins} 分钟`],
+    ['故障详情', safe(trunc(prevFault.message, 400))],
+    ['进入保护', safe(bjTimeStr(prevFault.at))],
+    ['持续时长', duration],
     ['解除方式', safe(how)],
-    ['解除时间', safe(bjNow().iso)],
+    ['解除时间', safe(bjTimeStr(Date.now()))],
   ];
-  if (notes) items.push(['对账结果', safe(notes)]);
+  if (notes) items.push(['对账结果', safe(trunc(notes, 400))]);
   const r = await sendTelegram(env, cfg, '✅ 【保护状态已解除】', items, '自动调度已恢复。', 5000);
   if (r.ok) {
     try { await appendLog(env, 'AUDIT', '保护状态解除通知', `${prevFault.code} → ${how}`); } catch { /* ignore */ }
@@ -1947,6 +1967,16 @@ async function tryAutoClearFault(env, cfg, state, engine) {
   return clear('触发故障的实例已从配置中移除');
 }
 
+// 面板重置状态：清空调度状态；若重置前处于保护状态，也发一条解除通知
+async function resetStateWithNotify(env, cfg, engine) {
+  const prev = await engine.loadState();
+  const prevFault = prev?.fault ? { ...prev.fault } : null;
+  const state = await engine.resetState();
+  await appendLogSafe(env, 'AUDIT', '重置状态', '清空调度状态与故障标记');
+  const notify = await notifyFaultCleared(env, cfg, prevFault, '人工重置（API）', '状态已重置为初始值');
+  return { state, notify };
+}
+
 // 清故障：先按真实状态对账，再清
 async function reconcileAndClearFault(env, cfg, state, engine) {
   const notes = [];
@@ -2175,8 +2205,9 @@ export default {
           return json(result);
         }
         case 'reset_state': {
-          const state = await engine.resetState();
-          return json({ ok: true, state });
+          const cfg0 = await getConfig(env);
+          const r = await resetStateWithNotify(env, cfg0, engine);
+          return json({ ok: true, state: r.state, notify: r.notify });
         }
         case 'start_instance': {
           const cfg = await getConfig(env);
@@ -2761,7 +2792,7 @@ async function act(action){
         : nt.reason === 'no_fault' ? '原本无故障，未发通知'
         : nt.skipped ? 'TG 未启用，未通知'
         : 'TG 通知失败：' + (nt.error || '未知原因');
-      toast('已清除保护状态。' + (r.notes || []).join('；') + '｜' + tgMsg, 'ok');
+      toast('已清除保护状态。' + (r.notes || []).join('；') + '｜' + tgMsg, (nt.ok || nt.reason === 'no_fault') ? 'ok' : 'warn');
     }
     else if (r && r.halted) toast('🚨 已进入保护状态：' + (r.fault?.code || ''), 'error');
     else if (r && r.error) toast('❌ ' + r.error, 'error');
@@ -3517,5 +3548,5 @@ function accountRow(a){
   resolveTrafficThreshold, resolveBillThreshold, resolveKeepAlive, inTimeRange,
   evaluateExhausted, validateConfig, bssEndpoint, maybeDailyReport,
   probeBilling, listEips, sanitizeConfig, reconcileAndClearFault, renderHtml,
-  normalizeHHMM,
+  normalizeHHMM, resetStateWithNotify,
 };

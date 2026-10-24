@@ -127,7 +127,12 @@ function makeEnv(cfg) {
 }
 
 function makeEngine(state) {
-  return { state, async loadState() { return this.state; }, async saveState(s) { this.state = s; } };
+  return {
+    state,
+    async loadState() { return this.state; },
+    async saveState(s) { this.state = s; },
+    async resetState() { this.state = defaultState(); return this.state; },
+  };
 }
 
 function acc(id, over) {
@@ -197,7 +202,7 @@ const M = await import(pathToFileURL(TESTMOD).href);
   runEngineCron, executeCron, getEngine, defaultState, trafficClass, quotaForClass,
   resolveTrafficThreshold, resolveBillThreshold, resolveKeepAlive,
   inTimeRange, evaluateExhausted, validateConfig, bssEndpoint,
-  probeBilling, reconcileAndClearFault, renderHtml, sanitizeConfig,
+  probeBilling, reconcileAndClearFault, renderHtml, sanitizeConfig, resetStateWithNotify,
 } = M;
 
 // ============================================================================
@@ -574,6 +579,7 @@ console.log('\n[9] fail-closed');
   await runEngineCron(env, eng);
   check('自动解除保护发 TG 通知', world.tg.some((t) => t.includes('保护状态已解除')), world.tg);
   check('解除通知含原错误码与持续时长', world.tg.some((t) => t.includes('ACCOUNT\\_NOT\\_CONFIGURED') && t.includes('5 分钟')), world.tg);
+  check('解除通知时间为北京时间（不含 UTC 的 T/Z）', world.tg.some((t) => /进入保护: \d{4}-\d{2}-\d{2} \d{2}:\d{2}/.test(t) && !/\d{4}-\d{2}-\d{2}T/.test(t)), world.tg);
 
   // 不节流：紧接着再次故障并解除，仍然再发一条
   st.fault = { code: 'ACCOUNT_NOT_CONFIGURED', at: new Date().toISOString(), message: 'x', accountId: 'a' };
@@ -613,6 +619,41 @@ console.log('\n[9] fail-closed');
   st3.fault = { code: 'TRANSITION_TIMEOUT', at: new Date().toISOString(), message: 'x', accountId: null };
   const r3 = await reconcileAndClearFault(env, cfg, st3, makeEngine(st3));
   check('TG 未启用时解除成功且通知跳过', r3.cleared === true && r3.notify?.skipped === true && world.tg.length === 0, r3.notify);
+}
+
+{
+  // 秒级故障：不到 1 分钟也不显示成 0 分钟
+  resetWorld();
+  const accounts = [acc('a')];
+  seed(accounts, 'i-a');
+  const cfg = baseConfig(accounts);
+  const env = makeEnv(cfg);
+  const st = { ...defaultState(), month: cstMonth(), dutyAccountId: 'a', dutySince: Date.now() };
+  st.fault = { code: 'CDT_QUERY_FAILED', at: new Date(Date.now() - 20 * 1000).toISOString(), message: 'timeout', accountId: null };
+  world.tg = [];
+  const r = await reconcileAndClearFault(env, cfg, st, makeEngine(st));
+  check('不足 1 分钟的故障显示秒', r.cleared === true && world.tg.some((t) => /持续时长: \d+ 秒/.test(t)), world.tg);
+}
+
+{
+  // API 重置状态时，若原本在保护中，也发解除通知
+  resetWorld();
+  const accounts = [acc('a')];
+  seed(accounts, 'i-a');
+  const cfg = baseConfig(accounts);
+  const env = makeEnv(cfg);
+  const st = { ...defaultState(), month: cstMonth(), dutyAccountId: 'a', dutySince: Date.now() };
+  st.fault = { code: 'CONFIG_INVALID', at: new Date(Date.now() - 90 * 1000).toISOString(), message: '参数不合法', accountId: null };
+  world.tg = [];
+  const r = await resetStateWithNotify(env, cfg, makeEngine(st));
+  check('重置状态时若在保护中则发解除通知', world.tg.some((t) => t.includes('保护状态已解除') && t.includes('人工重置')), world.tg);
+  check('重置后 state 回到初始值', r.state.fault === null && r.state.dutyAccountId === null, r.state);
+  check('重置通知返回 ok', r.notify?.ok === true, r.notify);
+
+  world.tg = [];
+  const st2 = { ...defaultState(), month: cstMonth() };
+  const r2 = await resetStateWithNotify(env, cfg, makeEngine(st2));
+  check('无故障时重置不发通知', r2.notify?.reason === 'no_fault' && world.tg.length === 0, r2.notify);
 }
 
 {
