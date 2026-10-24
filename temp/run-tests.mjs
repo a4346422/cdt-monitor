@@ -487,6 +487,14 @@ console.log('\n[9] fail-closed');
   const starts = world.startCalls.length;
   await runEngineCron(env, eng);
   check('故障期间不再操作实例', world.startCalls.length === starts, world.startCalls);
+  check('仍查不到时保持故障', st.fault && st.fault.code === 'CDT_QUERY_FAILED', st.fault);
+
+  // 流量查询恢复 → 下一轮 cron 自动解除保护，并继续正常判定
+  world.failCdt.delete('ak-b');
+  world.cdt['ak-b'] = [{ region: 'ap-southeast-1', gb: 3 }];
+  await runEngineCron(env, eng);
+  check('流量恢复后自动解除保护', st.fault === null, st.fault);
+  check('自愈后流量已刷新', st.accounts.b?.trafficGb === 3, st.accounts.b?.trafficGb);
 }
 
 {

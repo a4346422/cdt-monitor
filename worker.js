@@ -270,7 +270,7 @@ async function callAliyun(host, region, params, ak, sk, timeoutMs = REQUEST_TIME
       return await callAliyunOnce(host, region, params, ak, sk, timeoutMs);
     } catch (e) {
       last = e;
-      if (!(e instanceof AliyunError) || !e.retryable || attempt === RETRY_ATTEMPTS - 1) throw e;
+      if (!(e instanceof AliyunError) || !e.retryable || attempt === attempts - 1) throw e;
       await sleep(300 * (2 ** attempt) + attempt * 100);
     }
   }
@@ -1899,6 +1899,26 @@ async function tryAutoClearFault(env, cfg, state, engine) {
     state.fault = null;
     await engine.saveState(state);
     await appendLogSafe(env, 'AUDIT', '自动解除保护', '账单查询已恢复，BILL_QUERY_FAILED 自动清除');
+    return true;
+  }
+
+  // 流量故障：网络抖动也会落到这里。现场重查一次，成功即解除；仍失败则保持熔断。
+  if (fault.code === 'CDT_QUERY_FAILED') {
+    const targets = cfg.accounts.filter((a) => isConfigured(a));
+    if (!targets.length) {
+      state.fault = null;
+      await engine.saveState(state);
+      await appendLogSafe(env, 'AUDIT', '自动解除保护', '没有已配置实例，CDT_QUERY_FAILED 不再适用');
+      return true;
+    }
+    const traffic = await Promise.all(targets.map((a) => getCdtTraffic(a)));
+    const failed = [];
+    targets.forEach((a, i) => { if (!traffic[i].ok) failed.push(`${a.name}: ${traffic[i].error}`); });
+    // 仍失败：不写 KV，避免持续故障时每 2 分钟多一次写
+    if (failed.length) return false;
+    state.fault = null;
+    await engine.saveState(state);
+    await appendLogSafe(env, 'AUDIT', '自动解除保护', '流量查询已恢复，CDT_QUERY_FAILED 自动清除');
     return true;
   }
 

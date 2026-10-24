@@ -467,7 +467,7 @@ ECS 2014-05-26 里也没有这个动作；正确的动作是 `DescribeEipAddress
 |---|---|---|
 | `ACCOUNT_NOT_CONFIGURED` | 实例缺 AK/SK/地域/实例 ID（**历史故障码，已不再产生**） | 半配置实例现在只从调度中排除；遗留故障下一轮巡检**自动解除**，补全配置即恢复 |
 | `CONFIG_INVALID` | 配置参数不合法 | 设置里按提示范围修正 |
-| `CDT_QUERY_FAILED` | 流量查询失败（fail-closed） | 检查 `cdt:ListCdtInternetTraffic` 权限 |
+| `CDT_QUERY_FAILED` | 流量查询失败（fail-closed） | 网络抖动导致的失败，下一轮巡检现场重查成功即**自动解除**；持续失败再查 `cdt:ListCdtInternetTraffic` 权限 |
 | `BILL_QUERY_FAILED` | 账单查询失败（fail-closed） | 通常下一轮巡检现场重查成功即**自动解除**；持续失败再查 `bss:DescribeInstanceBill` 权限，或把账单阈值设为 0 |
 | `ECS_DESCRIBE_FAILED` | 查实例状态失败 | 检查 `ecs:DescribeInstances` 权限 |
 | `INSTANCE_NOT_FOUND` | 实例不存在或已被释放 | 设置里删除该实例或改成正确的实例 ID（**可自动解除**） |
