@@ -574,13 +574,12 @@ console.log('\n[9] fail-closed');
   await runEngineCron(env, eng);
   check('自动解除保护发 TG 通知', world.tg.some((t) => t.includes('保护状态已解除')), world.tg);
   check('解除通知含原错误码与持续时长', world.tg.some((t) => t.includes('ACCOUNT\\_NOT\\_CONFIGURED') && t.includes('5 分钟')), world.tg);
-  check('解除后写入节流标记', st.lastFaultClearNotify?.code === 'ACCOUNT_NOT_CONFIGURED', st.lastFaultClearNotify);
 
-  // 10 分钟内再次故障并解除：节流，不重复发
+  // 不节流：紧接着再次故障并解除，仍然再发一条
   st.fault = { code: 'ACCOUNT_NOT_CONFIGURED', at: new Date().toISOString(), message: 'x', accountId: 'a' };
   world.tg = [];
   await runEngineCron(env, eng);
-  check('10 分钟内重复解除被节流', st.fault === null && world.tg.length === 0, world.tg);
+  check('连续两次解除各发一条通知', st.fault === null && world.tg.filter((t) => t.includes('保护状态已解除')).length === 1, world.tg);
 }
 
 {

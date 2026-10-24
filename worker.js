@@ -115,7 +115,6 @@ function defaultState() {
     lastBillAttempt: null,   // { at, ok, error, skipped } 上一轮账单查询的真实结果
     lastTrafficCheck: null,
     fault: null,
-    lastFaultClearNotify: null,  // { code, at } 解除保护通知节流标记
     dailyReportDate: null,
   };
 }
@@ -697,14 +696,7 @@ async function sendTelegram(env, cfg, title, items, summary, timeoutMs = REQUEST
   }
 }
 
-// 同一错误码 10 分钟内只通知一次，避免网络抖动导致的反复解除刷屏
-const FAULT_CLEAR_NOTIFY_THROTTLE_MS = 10 * 60 * 1000;
-
-function markFaultClearNotify(state, code) {
-  state.lastFaultClearNotify = { code: code || 'UNKNOWN', at: Date.now() };
-}
-
-// 保护状态解除通知：Markdown 特殊字符先清掉，超时 5 秒，失败只落日志不影响主流程
+// 保护状态解除通知：Markdown 特殊字符先转义，超时 5 秒，失败只落日志不影响主流程
 async function notifyFaultCleared(env, cfg, prevFault, how, notes) {
   if (!prevFault) return { ok: false, skipped: true, reason: 'no_fault' };
   const safe = (v) => String(v == null || v === '' ? '-' : v).replace(/([_*`\[\]])/g, '\\$1');
@@ -1877,16 +1869,13 @@ async function tryAutoClearFault(env, cfg, state, engine) {
   const fault = state.fault;
   if (!fault) return false;
 
-  // 统一解除入口：一次落盘（含通知节流标记），再发 TG
+  // 统一解除入口：一次落盘，再发 TG（每次解除都通知，不节流）
   const clear = async (reason) => {
     const prev = { ...fault };
-    const last = state.lastFaultClearNotify;
-    const throttled = !!(last && last.code === prev.code && Date.now() - num(last.at, 0) < FAULT_CLEAR_NOTIFY_THROTTLE_MS);
-    if (!throttled) markFaultClearNotify(state, prev.code);
     state.fault = null;
     await engine.saveState(state);
     await appendLogSafe(env, 'AUDIT', '自动解除保护', reason);
-    if (!throttled) await notifyFaultCleared(env, cfg, prev, '自动自愈', reason);
+    await notifyFaultCleared(env, cfg, prev, '自动自愈', reason);
     return true;
   };
 
@@ -2022,7 +2011,6 @@ async function reconcileAndClearFault(env, cfg, state, engine) {
   if (code === 'INSTANCE_NOT_FOUND') notes.push('实例缺失问题已解决');
 
   state.fault = null;
-  if (prevFault) markFaultClearNotify(state, prevFault.code);
   await engine.saveState(state);
   await appendLogSafe(env, 'AUDIT', '清除故障', notes.join('；') || '人工清除');
   const notify = await notifyFaultCleared(env, cfg, prevFault, '人工清除（面板）', notes.join('；'));
@@ -2771,7 +2759,6 @@ async function act(action){
       const nt = r.notify || {};
       const tgMsg = nt.ok ? 'TG 通知已发送'
         : nt.reason === 'no_fault' ? '原本无故障，未发通知'
-        : nt.reason === 'throttled' ? '10 分钟内已通知过，已节流'
         : nt.skipped ? 'TG 未启用，未通知'
         : 'TG 通知失败：' + (nt.error || '未知原因');
       toast('已清除保护状态。' + (r.notes || []).join('；') + '｜' + tgMsg, 'ok');
