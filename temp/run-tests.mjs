@@ -25,6 +25,7 @@ const GB = 1024 ** 3;
 const world = {
   ecs: {}, startResult: {}, startCalls: [], stopCalls: [],
   dns: { content: '1.1.1.1' }, tg: [], cdt: {}, bill: {}, billCalls: [], failCdt: new Set(),
+  ecsCalls: [], failEcs: new Set(), cdtDelayMs: 0,
 };
 
 globalThis.fetch = async (url, init) => {
@@ -36,11 +37,14 @@ globalThis.fetch = async (url, init) => {
     const ak = form.get('AccessKeyId');
 
     if (action === 'ListCdtInternetTraffic') {
+      if (world.cdtDelayMs) await new Promise((r) => setTimeout(r, world.cdtDelayMs));
       if (world.failCdt.has(ak)) return json({ Code: 'Throttling', Message: '请求过于频繁' });
       const rows = world.cdt[ak] || [];
       return json({ TrafficDetails: rows.map((r) => ({ BusinessRegionId: r.region, Traffic: Math.round(r.gb * GB) })) });
     }
     if (action === 'DescribeInstances') {
+      world.ecsCalls.push(form.get('AccessKeyId'));
+      if (world.failEcs.has(form.get('AccessKeyId'))) return json({ Code: 'Throttling', Message: '请求过于频繁' });
       const id = JSON.parse(form.get('InstanceIds'))[0];
       const s = world.ecs[id];
       if (!s) return json({ Instances: { Instance: [] } });
@@ -175,6 +179,9 @@ function resetWorld() {
   world.cdt = {};
   world.bill = {};
   world.eips = {};
+  world.ecsCalls = [];
+  world.failEcs = new Set();
+  world.cdtDelayMs = 0;
   world.failCdt = new Set();
   timeOffset = 0;
 }
@@ -1983,6 +1990,46 @@ console.log('\n[27] 账单跨轮分摊、展示字段降频、日写入预算');
   const after2 = JSON.parse(store.state_v2);
   check('lastBillAttempt 带 account 字段', after2.lastBillAttempt?.account === '账号 BM1', after2.lastBillAttempt);
   check('lastBillAttempt 带 skipped 字段', after2.lastBillAttempt?.skipped === 0, after2.lastBillAttempt);
+}
+
+{
+  // 单轮耗时控制：重试次数降到 2，以及并发轮次的互斥
+  resetWorld();
+  const accounts = [acc('rt1')];
+  seed(accounts, 'i-rt1');
+  const cfg = baseConfig(accounts, [{ id: 'g-rt', name: '耗时组', rotationIntervalMinutes: 0, cf: { enabled: false } }]);
+  const store = { app_config: JSON.stringify(cfg), app_logs: '[]', state_v2: JSON.stringify({ ...defaultState(), month: cstMonth() }) };
+  const env = {
+    store,
+    STATE_KV: {
+      async get(k, opts) { const v = store[k]; if (v === undefined) return null; return opts?.type === 'json' ? JSON.parse(v) : v; },
+      async put(k, v) { store[k] = v; },
+      async delete(k) { delete store[k]; },
+    },
+  };
+
+  // ECS 持续限流：单次 describe 只允许重试到 2 次
+  world.failEcs.add('ak-rt1');
+  world.ecsCalls = [];
+  await executeCron(env);
+  check('ECS 限流时单次 describe 最多尝试 2 次（不是 3 次）',
+    world.ecsCalls.length > 0 && world.ecsCalls.length <= 2, world.ecsCalls.length);
+  world.failEcs = new Set();
+
+  // 并发：上一轮未结束时第二轮直接跳过，避免两轮同时写 state_v2
+  resetWorld();
+  seed(accounts, 'i-rt1');
+  store.state_v2 = JSON.stringify({ ...defaultState(), month: cstMonth() });
+  world.cdtDelayMs = 120;
+  const p1 = executeCron(env);
+  await new Promise((r) => setTimeout(r, 20));
+  const r2 = await executeCron(env);
+  check('上一轮未结束时本轮被跳过', r2.skipped === true && r2.reason === 'previous_round_running', r2);
+  const r1 = await p1;
+  check('被跳过的一轮不会报错', !r1.error, r1.error);
+  world.cdtDelayMs = 0;
+  const r3 = await executeCron(env);
+  check('上一轮结束后可以正常执行', !r3.skipped && !r3.error, r3);
 }
 
 console.log(`\n${pass} passed, ${fail} failed`);

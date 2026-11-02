@@ -33,6 +33,9 @@ const BSS_PHASE_BUDGET_MS = 120000;
 const CRON_SOFT_BUDGET_MS = 45000;
 // 单个账号的账单查询（账号账单 + 实例账单 + 余额）预算，超出则留到下轮
 const BILL_ACCOUNT_BUDGET_MS = 35000;
+// ECS / CDT 的重试次数。比账单类接口低一档：每分钟一轮的前提下，
+// 3 次重试会让「describe + 流量」最坏吃掉 60 秒，与下一轮重叠。
+const CRON_RETRY_ATTEMPTS = 2;
 // 面板实时流量查询预算：单次 4 秒、不重试、整批最多 8 秒
 const LIVE_QUERY_TIMEOUT_MS = 4000;
 const LIVE_QUERY_BUDGET_MS = 8000;
@@ -326,7 +329,7 @@ async function getCdtTraffic(acc, opts = {}) {
     const res = await callAliyun('cdt.aliyuncs.com', 'cn-hongkong', {
       Action: 'ListCdtInternetTraffic',
       Version: '2021-08-13',
-    }, acc.ak, acc.sk, opts.timeoutMs || REQUEST_TIMEOUT_MS, opts.attempts || RETRY_ATTEMPTS);
+    }, acc.ak, acc.sk, opts.timeoutMs || REQUEST_TIMEOUT_MS, opts.attempts || CRON_RETRY_ATTEMPTS);
 
     const rows = res.TrafficDetails;
     if (!Array.isArray(rows) || rows.length === 0) {
@@ -358,7 +361,7 @@ async function describeEcs(acc) {
       Action: 'DescribeInstances',
       Version: '2014-05-26',
       InstanceIds: JSON.stringify([acc.instanceId]),
-    }, acc.ak, acc.sk);
+    }, acc.ak, acc.sk, REQUEST_TIMEOUT_MS, CRON_RETRY_ATTEMPTS);
 
     const item = res.Instances?.Instance?.[0];
     if (!item) return { ok: false, status: 'NotFound', error: '实例不存在或无权限' };
@@ -2002,8 +2005,18 @@ function buildRunSummary(before, after, state, cfg, ms, result, actions = null) 
   };
 }
 
+// 单轮重入保护：单轮最坏耗时（describe + 流量 + 账单）可能超过 60 秒，
+// 一旦重叠，两轮会同时读写 state_v2，后写覆盖先写。这里用模块级标记兜底，
+// 跳过的这一轮不算故障，下一轮（通常 60 秒后）会继续。
+let cronRunning = false;
+
 async function executeCron(env) {
   const startedAt = Date.now();
+  if (cronRunning) {
+    return { skipped: true, reason: 'previous_round_running',
+      run: { ms: 0, started: [], stopped: [], duties: [], fault: null, error: null } };
+  }
+  cronRunning = true;
   try {
     const engine = getEngine(env);
     const cfg = await getConfig(env);
@@ -2017,6 +2030,8 @@ async function executeCron(env) {
   } catch (e) {
     await appendLogSafe(env, 'ERROR', 'Cron执行异常', e.message);
     return { error: e.message, run: { ms: Date.now() - startedAt, started: [], stopped: [], duties: [], fault: null, error: e.message } };
+  } finally {
+    cronRunning = false;
   }
 }
 
@@ -2968,10 +2983,13 @@ async function act(action){
       else if (r && r.error) toast('❌ 发送失败：' + r.error, 'error');
       else toast('发送结果未知', 'warn');
     } else if (action === 'trigger_cron') {
-      const d = describeRun(r);
-      if (d) toast(d.msg, d.kind);
-      else if (r && r.error) toast('❌ ' + r.error, 'error');
-      else toast('巡检完成（未返回摘要）', 'ok');
+      if (r && r.skipped) toast('上一轮巡检仍在执行，本次已跳过（稍后再试）', 'warn');
+      else {
+        const d = describeRun(r);
+        if (d) toast(d.msg, d.kind);
+        else if (r && r.error) toast('❌ ' + r.error, 'error');
+        else toast('巡检完成（未返回摘要）', 'ok');
+      }
     } else if (r && r.cleared === false) toast('未能清除：' + (r.notes || []).join('；'), 'warn');
     else if (r && r.cleared === true) {
       const nt = r.notify || {};
