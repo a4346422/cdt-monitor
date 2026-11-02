@@ -24,7 +24,7 @@ const GB = 1024 ** 3;
 
 const world = {
   ecs: {}, startResult: {}, startCalls: [], stopCalls: [],
-  dns: { content: '1.1.1.1' }, tg: [], cdt: {}, bill: {}, failCdt: new Set(),
+  dns: { content: '1.1.1.1' }, tg: [], cdt: {}, bill: {}, billCalls: [], failCdt: new Set(),
 };
 
 globalThis.fetch = async (url, init) => {
@@ -65,6 +65,7 @@ globalThis.fetch = async (url, init) => {
       return json({ RequestId: 'r' });
     }
     if (action === 'DescribeInstanceBill') {
+      world.billCalls.push(`${action}:${ak}`);
       const b = world.bill[ak];
       if (b === undefined) return json({ Code: 'NotApplicable', Message: 'This API is not applicable for caller.' });
       const all = typeof b === 'number'
@@ -93,6 +94,7 @@ globalThis.fetch = async (url, init) => {
       return json({ Eips: { Eip: list }, TotalCount: list.length });
     }
     if (action === 'QueryAccountBalance') {
+      world.billCalls.push(`${action}:${ak}`);
       return json({ Code: '200', Data: { AvailableAmount: '12.34', Currency: 'USD' } });
     }
     return json({});
@@ -144,8 +146,8 @@ function acc(id, over) {
   };
 }
 
-function baseConfig(accounts) {
-  return {
+function baseConfig(accounts, groups) {
+  const cfg = {
     adminPass: 'x',
     system: {
       trafficThresholdChina: 18, trafficThresholdIntl: 188, billThreshold: 0,
@@ -157,6 +159,9 @@ function baseConfig(accounts) {
     cf: { apiToken: 't', zoneId: 'z', recordId: 'r', domainName: 'd.example.com' },
     notify: { tg: { enabled: true, botToken: 'bt', chatId: 'ci' } },
   };
+  // 传了 groups 才写进配置；不传时保持旧行为（让 getConfig 走旧的单组迁移路径）
+  if (groups) cfg.groups = groups;
+  return cfg;
 }
 
 function resetWorld() {
@@ -164,6 +169,7 @@ function resetWorld() {
   world.startResult = {};
   world.startCalls = [];
   world.stopCalls = [];
+  world.billCalls = [];
   world.dns = { content: '1.1.1.1' };
   world.tg = [];
   world.cdt = {};
@@ -189,6 +195,11 @@ function seed(accounts, runningId) {
 function cstMonth() {
   return new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Shanghai', year: 'numeric', month: '2-digit' })
     .format(new Date()).slice(0, 7);
+}
+
+function cstDate() {
+  return new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Shanghai', year: 'numeric', month: '2-digit', day: '2-digit' })
+    .format(new Date());
 }
 
 let pass = 0, fail = 0;
@@ -1609,14 +1620,15 @@ console.log('\n[26] executeCron 稳态 KV 读写次数与日报单次触发');
     },
   };
 
-  // 稳态第一轮先对齐并排除初始化开销，测量后续稳态每轮调用
+  // 稳态第一轮先对齐并排除初始化开销；第二轮让展示字段落盘一次
+  await executeCron(env);
   await executeCron(env);
   getCount = 0;
   putCount = 0;
   const res = await executeCron(env);
   check('executeCron 正常返回 ok', res?.ok === true, res);
   check('稳态一次 executeCron 的 KV 读为 2 次', getCount === 2, getCount);
-  check('稳态一次 executeCron 的 KV 写为 1 次', putCount === 1, putCount);
+  check('稳态无变更时 KV 写为 0 次（展示字段已降频）', putCount === 0, putCount);
   check('executeCron 返回 run 摘要', !!res?.run && typeof res.run.ms === 'number', res?.run);
   check('run 摘要记录当班实例', Array.isArray(res?.run?.duties) && res.run.duties.some(d => d.name.includes('KV1')), res?.run?.duties);
   check('稳态无变更时 started/stopped 为空', res?.run?.started.length === 0 && res?.run?.stopped.length === 0, res?.run);
@@ -1659,6 +1671,158 @@ console.log('\n[26] executeCron 稳态 KV 读写次数与日报单次触发');
   });
   const res = await executeCron(env);
   check('换班开始体现在 run.transition', res?.run?.transition === 'started', res?.run);
+}
+
+// ============================================================================
+console.log('\n[27] 账单跨轮分摊、展示字段降频、日写入预算');
+{
+  const mkEnv = (st) => {
+    const groups = [{
+      id: 'g-th', name: '节流组', rotationIntervalMinutes: 60, primaryAccountId: null,
+      cf: { enabled: true, apiToken: 't', zoneId: 'z', recordId: 'r', domainName: 'th.example.com' },
+    }];
+    const accounts = [acc('th1', { groupId: 'g-th' }), acc('th2', { groupId: 'g-th' })];
+    seed(accounts, 'i-th1');
+    world.dns.content = world.ecs['i-th1'].eip;
+    const cfg = baseConfig(accounts, groups);
+    const store = { app_config: JSON.stringify(cfg), app_logs: '[]', state_v2: JSON.stringify(st) };
+    const box = { putCount: 0 };
+    const env = {
+      store,
+      STATE_KV: {
+        async get(k, opts) { const v = store[k]; if (v === undefined) return null; return opts?.type === 'json' ? JSON.parse(v) : v; },
+        async put(k, v) { if (k === 'state_v2') box.putCount++; store[k] = v; },
+        async delete(k) { delete store[k]; },
+      },
+    };
+    return { env, store, box };
+  };
+
+  const baseSt = () => ({
+    ...defaultState(),
+    month: cstMonth(),
+    lastBillCheck: Date.now(),
+    groups: {
+      'g-th': { dutyAccountId: 'th1', dutySince: Date.now(), rotationIndex: 0, transition: null, startAttempt: null, fusedMonth: cstMonth() },
+    },
+  });
+
+  // ---- 账单跨轮分摊：每轮最多查 1 个账号，且不重叠
+  resetWorld();
+  world.bill = { 'ak-th1': 5, 'ak-th2': 7 };
+  let h = mkEnv({ ...baseSt(), lastBillCheck: Date.now() - 31 * 60000 });
+  await executeCron(h.env);
+  check('账单到期后第一轮最多 3 次 BSS 调用（账号账单 + 实例账单 + 余额）', world.billCalls.length <= 3, world.billCalls);
+  check('第一轮只命中第一个账号', world.billCalls.length > 0 && world.billCalls.every((c) => c.endsWith(':ak-th1')), world.billCalls);
+
+  world.billCalls = [];
+  await executeCron(h.env);
+  check('第二轮只命中第二个账号', world.billCalls.length > 0 && world.billCalls.every((c) => c.endsWith(':ak-th2')), world.billCalls);
+  const swept = JSON.parse(h.store.state_v2);
+  check('扫完所有账号后账单窗口关闭、游标归零', !swept.billWindowStart && swept.billCursor === 0, { w: swept.billWindowStart, c: swept.billCursor });
+  check('扫完后账号账单金额已落盘', swept.accounts['th2']?.billAmount === '7.00' || swept.accounts['th2']?.billAmount === 7, swept.accounts['th2']?.billAmount);
+
+  // ---- 展示字段降频
+  resetWorld();
+  world.bill = {};
+  h = mkEnv(baseSt());
+  await executeCron(h.env);          // 初始化
+  await executeCron(h.env);          // 展示字段落盘一次
+  h.box.putCount = 0;
+  await executeCron(h.env);
+  check('10 分钟内不重复落盘展示字段', h.box.putCount === 0, h.box.putCount);
+
+  timeOffset += 10 * 60 * 1000 + 1000;
+  h.box.putCount = 0;
+  await executeCron(h.env);
+  check('超过 10 分钟落盘一次展示字段', h.box.putCount === 1, h.box.putCount);
+  timeOffset = 0;
+
+  // ---- 关键字段变化不受降频限制
+  resetWorld();
+  world.bill = { 'ak-th1': 5, 'ak-th2': 7 };
+  h = mkEnv({ ...baseSt(), lastBillCheck: Date.now() - 31 * 60000, lastDisplayPersistAt: Date.now() });
+  h.box.putCount = 0;
+  await executeCron(h.env);
+  check('账单窗口开启属关键变化，立即落盘（不受 10 分钟降频影响）', h.box.putCount === 1, h.box.putCount);
+
+  // ---- 日写入预算
+  resetWorld();
+  world.bill = {};
+  h = mkEnv({ ...baseSt(), lastDisplayPersistAt: 0, kvBudget: { date: cstDate(), writes: 750, cappedAt: null } });
+  await executeCron(h.env);          // 初始化
+  await executeCron(h.env);          // 记下 cappedAt 并告警
+  h.box.putCount = 0;
+  await executeCron(h.env);
+  check('预算耗尽后展示字段停止落盘', h.box.putCount === 0, h.box.putCount);
+  check('预算耗尽只告警一次（cappedAt 已记录）', !!JSON.parse(h.store.state_v2).kvBudget?.cappedAt, JSON.parse(h.store.state_v2).kvBudget);
+
+  // ---- 预算耗尽不影响关键字段
+  resetWorld();
+  world.bill = { 'ak-th1': 5, 'ak-th2': 7 };
+  h = mkEnv({
+    ...baseSt(), lastBillCheck: Date.now() - 31 * 60000, lastDisplayPersistAt: Date.now(),
+    kvBudget: { date: cstDate(), writes: 900, cappedAt: new Date().toISOString() },
+  });
+  h.box.putCount = 0;
+  await executeCron(h.env);
+  check('预算耗尽时关键字段仍然照常落盘', h.box.putCount === 1, h.box.putCount);
+}
+
+{
+  // 面板实时流量：现查 CDT 直接返回，不写 KV
+  resetWorld();
+  const accounts = [acc('lv1')];
+  seed(accounts, 'i-lv1');
+  world.cdt['ak-lv1'] = [{ region: accounts[0].regionId, gb: 12.5 }];
+  const cfg = baseConfig(accounts);
+  const store = {
+    app_config: JSON.stringify(cfg), app_logs: '[]',
+    state_v2: JSON.stringify({ ...defaultState(), month: cstMonth() }),
+  };
+  let putCount = 0;
+  const env = {
+    store,
+    STATE_KV: {
+      async get(k, opts) { const v = store[k]; if (v === undefined) return null; return opts?.type === 'json' ? JSON.parse(v) : v; },
+      async put(k, v) { putCount++; store[k] = v; },
+      async delete(k) { delete store[k]; },
+    },
+  };
+  const token = 'lv-token';
+  store[`session:${token}`] = JSON.stringify({ expiresAt: Date.now() + 11 * 3600 * 1000, ttlMs: 12 * 3600 * 1000 });
+  putCount = 0;
+  const res = await M.default.fetch(new Request('https://w.dev/api/state?live=1', { headers: { Cookie: `cdt_session=${token}` } }), env);
+  const data = await res.json();
+  check('面板 ?live=1 返回实时流量值', data.accounts[0].trafficGb === 12.5, data.accounts[0].trafficGb);
+  check('面板 ?live=1 标记 trafficLive', data.accounts[0].trafficLive === true, data.accounts[0].trafficLive);
+  check('面板 ?live=1 标记 liveAttempted', data.liveAttempted === true, data.liveAttempted);
+  check('面板 ?live=1 不产生 KV 写', putCount === 0, putCount);
+}
+
+{
+  // 日志节流：cron 每分钟一轮，持续失败时不能每轮都写一条
+  const store = { app_logs: '[]' };
+  const env = {
+    STATE_KV: {
+      async get(k, opts) { const v = store[k]; if (v === undefined) return null; return opts?.type === 'json' ? JSON.parse(v) : v; },
+      async put(k, v) { store[k] = v; },
+      async delete(k) { delete store[k]; },
+    },
+  };
+  await M.appendLog(env, 'ERROR', 'Cron执行异常', '第一次');
+  await M.appendLog(env, 'ERROR', 'Cron执行异常', '第二次');
+  let logs = await M.readLogs(env);
+  check('同 level+title 的非审计日志 10 分钟内只写一条', logs.filter((l) => l.title === 'Cron执行异常').length === 1, logs.map((l) => l.title));
+
+  await M.appendLog(env, 'AUDIT', '登录成功', '1');
+  await M.appendLog(env, 'AUDIT', '登录成功', '2');
+  logs = await M.readLogs(env);
+  check('审计日志不受节流影响', logs.filter((l) => l.title === '登录成功').length === 2, logs.filter((l) => l.title === '登录成功').length);
+
+  await M.appendLog(env, 'ERROR', 'Cron执行异常', '第三次');
+  logs = await M.readLogs(env);
+  check('节流窗口内重复错误始终只保留一条', logs.filter((l) => l.title === 'Cron执行异常').length === 1, logs.map((l) => l.title));
 }
 
 {

@@ -29,6 +29,14 @@ const BSS_TIMEOUT_MS = 15000;
 const BSS_ATTEMPTS = 2;
 // 一轮账单阶段的总预算，超过就跳过剩余账号，避免 cron 越跑越久
 const BSS_PHASE_BUDGET_MS = 120000;
+// cron 每分钟一轮：单轮软预算必须明显小于 60 秒，否则相邻两轮会重叠并互相覆盖 state。
+const CRON_SOFT_BUDGET_MS = 45000;
+// 单个账号的账单查询（账号账单 + 实例账单 + 余额）预算，超出则留到下轮
+const BILL_ACCOUNT_BUDGET_MS = 35000;
+// 展示字段（流量/账单金额/余额/时间戳等）的落盘周期：关键字段不受它限制
+const DISPLAY_PERSIST_MS = 10 * 60 * 1000;
+// 每日 state 写入硬上限：耗尽后只停写展示字段，关键状态照常写入
+const WRITE_BUDGET_PER_DAY = 750;
 const RETRY_ATTEMPTS = 3;
 
 // CDT 免费额度按地域类别分成两个独立池
@@ -113,6 +121,10 @@ function defaultState() {
     fusedMonth: null,
     lastBillCheck: 0,
     lastBillAttempt: null,   // { at, ok, error, skipped } 上一轮账单查询的真实结果
+    billWindowStart: 0,      // 账单扫描窗口开始时间；窗口内每轮只查一个账号
+    billCursor: 0,           // 本轮该查第几个账号
+    lastDisplayPersistAt: 0, // 上次落盘展示字段的时间
+    kvBudget: null,          // { date, writes, cappedAt } 当日 state 写入计数，随 state 一起落盘
     lastTrafficCheck: null,
     fault: null,
     dailyReportDate: null,
@@ -821,8 +833,18 @@ async function readLogs(env) {
   return Array.isArray(raw) ? raw : [];
 }
 
+// 非审计日志的去重窗口：cron 每分钟一轮，持续失败时若不去重会瞬间写满 KV 免费额度。
+// 审计（AUDIT）是业务事件（登录/换班/启停/熔断），一律保留。
+const LOG_THROTTLE_MS = 10 * 60 * 1000;
+
 async function appendLog(env, level, title, detail) {
   const logs = await readLogs(env);
+  if (level !== 'AUDIT') {
+    const nowMs = Date.now();
+    const dup = logs.find((l) => l.level === level && l.title === title
+      && nowMs - Date.parse(l.at) < LOG_THROTTLE_MS);
+    if (dup) return;
+  }
   logs.unshift({ at: new Date().toISOString(), level, title, detail: detail || '' });
   await env.STATE_KV.put('app_logs', JSON.stringify(logs.slice(0, 300)));
 }
@@ -979,6 +1001,69 @@ function syncLegacyStateView(state, cfg) {
   state.fusedMonth = gSched.fusedMonth;
 }
 
+// ---------------------------------------------------------------- 写入节流
+
+// 每日写入计数：在 saveState 里自增，跟着 state 一起落盘，不产生额外写
+function bumpWriteBudget(state) {
+  const today = bjNow().date;
+  if (!state.kvBudget || state.kvBudget.date !== today) {
+    state.kvBudget = { date: today, writes: 0, cappedAt: null };
+  }
+  state.kvBudget.writes = num(state.kvBudget.writes, 0) + 1;
+}
+
+// 关键字段签名：一变就必须立即落盘，绝不能被展示字段的降频拖住。
+// 只收录「有实际值」的条目：否则首次填充展示字段（trafficGb 等）也会被当成关键变化。
+function keySignature(state) {
+  const groups = {};
+  for (const gid of Object.keys(state.groups || {})) {
+    const g = state.groups[gid] || {};
+    if (!g.dutyAccountId && !g.transition && !g.startAttempt && !g.fusedMonth
+        && !g.lastSyncedDnsIp && !g.rotationIndex) continue;
+    groups[gid] = [
+      g.dutyAccountId || null, num(g.dutySince, 0), num(g.rotationIndex, 0),
+      g.transition || null, g.startAttempt || null,
+      g.fusedMonth || null, g.lastSyncedDnsIp || null,
+    ];
+  }
+  const accounts = {};
+  for (const aid of Object.keys(state.accounts || {})) {
+    const a = state.accounts[aid] || {};
+    const mo = a.manualOverride
+      ? [a.manualOverride.action, a.manualOverride.inWindow, num(a.manualOverride.at, 0)] : null;
+    if (!a.exhausted && a.billOk == null && !a.billError && !mo) continue;
+    accounts[aid] = [!!a.exhausted, a.billOk ?? null, a.billError || null, mo];
+  }
+  return JSON.stringify([
+    state.month, state.fault ? [state.fault.code, state.fault.at] : null,
+    num(state.lastBillCheck, 0), num(state.billWindowStart, 0), num(state.billCursor, 0),
+    state.lastBillAttempt ? [state.lastBillAttempt.at, state.lastBillAttempt.ok] : null,
+    state.dailyReportDate || null, groups, accounts,
+  ]);
+}
+
+// 是否落盘：关键字段变了 → 立即写；否则按 DISPLAY_PERSIST_MS 降频，并受日预算约束
+async function persistStateIfNeeded(env, engine, state, opts) {
+  if (opts.wroteInRound) return false;          // 本轮已经写过，不重复写
+  if (opts.keyChanged) { await engine.saveState(state); return true; }
+
+  const budget = state.kvBudget || {};
+  if (num(budget.writes, 0) >= WRITE_BUDGET_PER_DAY) {
+    if (!budget.cappedAt) {
+      // 只告警一次：记下时间并落盘，否则每轮都会重复写日志
+      budget.cappedAt = new Date().toISOString();
+      await engine.saveState(state);
+      await appendLogSafe(env, 'WARN', 'KV 写入预算已用尽',
+        `今日已写 ${budget.writes} 次，展示字段停止落盘（关键状态仍照常写入）。如需更频繁刷新请升级 Workers Paid。`);
+    }
+    return false;
+  }
+  if (Date.now() - num(state.lastDisplayPersistAt, 0) < DISPLAY_PERSIST_MS) return false;
+  state.lastDisplayPersistAt = Date.now();
+  await engine.saveState(state);
+  return true;
+}
+
 // 分组内参与调度的实例：配置不完整的不参与选当班/轮换/换班。
 // rotationIndex 必须相对这个集合计算，否则会与 pickNextDuty 的池子错位。
 function groupActiveAccounts(cfg, groupId) {
@@ -1071,6 +1156,9 @@ async function runEngineCron(env, engine, preCfg, preState, actions = null) {
   const cfg = preCfg || await getConfig(env);
   const state = preState || await engine.loadState();
   const now = bjNow();
+  const runStart = Date.now();
+  const writesBefore = num(state.kvBudget?.writes, 0);
+  const keySigBefore = keySignature(state);
 
   // ---- 跨月：所有账号额度恢复
   if (state.month !== now.month) {
@@ -1140,35 +1228,55 @@ async function runEngineCron(env, engine, preCfg, preState, actions = null) {
     return setFault(env, engine, state, 'CDT_QUERY_FAILED', failed.join('; '));
   }
 
-  // ---- 账单与余额（按间隔节流）
-  // 账单阈值按账号级判定：额度和费用都是账号维度，而且能抓到未纳入监控的其他资源。
-  const billDue = Date.now() - num(state.lastBillCheck, 0) >= num(cfg.system.billCheckMinutes, 30) * 60000;
+  // ---- 账单与余额：每轮最多查 1 个账号，跨轮次分摊
+  // 单轮最长耗时因此被压在 CRON_SOFT_BUDGET_MS 以内，每分钟的轮次不会重叠，
+  // 也就天然满足「同一时间只有一轮账单查询」——不依赖 KV 锁（KV 是最终一致的，做不了原子锁）。
+  const billCandidates = cfg.accounts.filter(isConfigured);
+  const billIntervalMs = num(cfg.system.billCheckMinutes, 30) * 60000;
+  if (!state.billWindowStart && billCandidates.length
+      && Date.now() - num(state.lastBillCheck, 0) >= billIntervalMs) {
+    state.billWindowStart = Date.now();
+    state.billCursor = 0;
+  }
+
   const bills = {};
-  if (billDue && cfg.accounts.length) {
-    // 串行查询：BSS 对并发很敏感，3N 并发容易排队到超时
-    const phaseStart = Date.now();
-    let billSkipped = 0;
-    for (const acc of cfg.accounts) {
-      if (!isConfigured(acc)) continue;
-      if (Date.now() - phaseStart > BSS_PHASE_BUDGET_MS) { billSkipped++; continue; }
+  if (state.billWindowStart && billCandidates.length) {
+    const budgetLeft = CRON_SOFT_BUDGET_MS - (Date.now() - runStart);
+    if (budgetLeft >= 5000) {
+      const idx = Math.max(0, Math.min(num(state.billCursor, 0), billCandidates.length - 1));
+      const acc = billCandidates[idx];
+      const phaseStart = Date.now();
+      // 单账号预算同时受「本账号上限」和「本轮剩余软预算」约束，保证整轮不超 60 秒
+      const accBudget = Math.min(BILL_ACCOUNT_BUDGET_MS, budgetLeft);
+      const overBudget = () => Date.now() - phaseStart > accBudget;
       const account = await queryBillSafe(acc, { cycle: now.month });
-      const instance = await queryBillSafe(acc, { cycle: now.month, instanceId: acc.instanceId });
-      const balance = await getAccountBalance(acc);
+      const instance = overBudget()
+        ? { ok: false, error: '单账号账单预算耗尽，已留到下轮', skipped: true }
+        : await queryBillSafe(acc, { cycle: now.month, instanceId: acc.instanceId });
+      const balance = overBudget()
+        ? { ok: false, error: '单账号账单预算耗尽，已留到下轮', skipped: true }
+        : await getAccountBalance(acc);
       bills[acc.id] = { account, instance, balance };
+
+      // 记录本轮结果：面板和故障自愈都靠它，不再被下一轮“未查询”覆盖
+      const billFailures = account.ok ? [] : [`${acc.name}: ${account.error || '账单不可用'}`];
+      state.lastBillAttempt = {
+        at: Date.now(),
+        ok: billFailures.length === 0,
+        error: billFailures.join('; ') || null,
+        account: acc.name,
+        skipped: 0,
+      };
+      if (billFailures.length) await appendLogSafe(env, 'WARN', '账单查询失败', billFailures.join('; '));
+
+      // 游标推进；扫完最后一个账号即结束本窗口，billCheckMinutes 后再开新窗口
+      state.billCursor = idx + 1;
+      if (state.billCursor >= billCandidates.length) {
+        state.lastBillCheck = Date.now();
+        state.billWindowStart = 0;
+        state.billCursor = 0;
+      }
     }
-    state.lastBillCheck = Date.now();
-    const billFailures = cfg.accounts
-      .filter((a) => bills[a.id]?.account && !bills[a.id].account.ok)
-      .map((a) => `${a.name}: ${bills[a.id].account.error || '账单不可用'}`);
-    if (billSkipped) billFailures.push(`${billSkipped} 个账号因本轮耗时超预算被跳过`);
-    // 记录本轮结果：面板和故障自愈都靠它，不再被下一轮“未查询”覆盖
-    state.lastBillAttempt = {
-      at: Date.now(),
-      ok: billFailures.length === 0,
-      error: billFailures.join('; ') || null,
-      skipped: billSkipped,
-    };
-    if (billFailures.length) await appendLogSafe(env, 'WARN', '账单查询失败', billFailures.join('; '));
   }
 
   // ---- 汇总每账号状态
@@ -1189,7 +1297,7 @@ async function runEngineCron(env, engine, preCfg, preState, actions = null) {
       // 该实例应付金额：仅用于展示
       billInstanceAmount: instBill ? (instBill.ok ? instBill.amount : prev.billInstanceAmount ?? null) : (prev.billInstanceAmount ?? null),
       billCurrency: acctBill?.ok ? acctBill.currency : (instBill?.ok ? instBill.currency : (prev.billCurrency ?? null)),
-      billOk: acctBill ? acctBill.ok : (prev.billOk ?? false),
+      billOk: acctBill ? acctBill.ok : (prev.billOk ?? null),
       // 本轮没查账单时保留上次的错误，否则面板只剩“金额 + 无错误”看不出问题
       billError: acctBill ? (acctBill.ok ? null : acctBill.error) : (prev.billError ?? null),
       balance: b?.balance ? (b.balance.ok ? b.balance.balance : (prev.balance ?? null)) : (prev.balance ?? null),
@@ -1213,7 +1321,7 @@ async function runEngineCron(env, engine, preCfg, preState, actions = null) {
   }
 
   // 启用了账单阈值但账号级账单查不出来的账号，fail-closed
-  // 注意：未配置完整的账号不参与该判定，否则会和自愈逻辑互相矛盾（每 2 分钟反复报故障）
+  // 注意：未配置完整的账号不参与该判定，否则会和自愈逻辑互相矛盾（每轮巡检反复报故障）
   const billFailures = cfg.accounts
     .filter((a) => isConfigured(a) && resolveBillThreshold(a, cfg) > 0)
     .filter((a) => state.accounts[a.id]?.billOk === false)
@@ -1387,9 +1495,12 @@ async function runEngineCron(env, engine, preCfg, preState, actions = null) {
   }
 
   } finally {
-    // 稳态统一落盘；提前 return（换班/熔断）会多写一次，属有意为之，用于兜住异常退出路径
+    // 稳态不再无条件落盘：关键字段变了才写，其余按 DISPLAY_PERSIST_MS 降频
     syncLegacyStateView(state, cfg);
-    await engine.saveState(state);
+    await persistStateIfNeeded(env, engine, state, {
+      keyChanged: keySignature(state) !== keySigBefore,
+      wroteInRound: num(state.kvBudget?.writes, 0) > writesBefore,
+    });
   }
   return cronResult;
 }
@@ -1810,6 +1921,7 @@ function getEngine(env) {
       return defaultState();
     },
     async saveState(state) {
+      bumpWriteBudget(state);
       await env.STATE_KV.put('state_v2', JSON.stringify(state));
     },
     async resetState() {
@@ -1955,7 +2067,7 @@ async function tryAutoClearFault(env, cfg, state, engine) {
     const traffic = await Promise.all(targets.map((a) => getCdtTraffic(a)));
     const failed = [];
     targets.forEach((a, i) => { if (!traffic[i].ok) failed.push(`${a.name}: ${traffic[i].error}`); });
-    // 仍失败：不写 KV，避免持续故障时每 2 分钟多一次写
+    // 仍失败：不写 KV，避免持续故障时每轮多一次写
     if (failed.length) return false;
     return clear('流量查询已恢复，CDT_QUERY_FAILED 自动清除');
   }
@@ -2152,7 +2264,15 @@ export default {
       const engine = getEngine(env);
       const state = await engine.loadState();
       const logs = await readLogs(env);
-      const accounts = cfg.accounts.map((a) => {
+      // 面板打开时的「实时」流量：现查一次 CDT 直接返回，不写 KV。
+      // 降频落盘只影响 KV 里的快照，不影响这里的实时展示。
+      const wantLive = url.searchParams.get('live') === '1';
+      const live = wantLive
+        ? await Promise.all(cfg.accounts.map((a) => (isConfigured(a)
+          ? getCdtTraffic(a).catch((e) => ({ ok: false, error: e.message }))
+          : Promise.resolve({ ok: false, skipped: true, error: '未配置完整' }))))
+        : null;
+      const accounts = cfg.accounts.map((a, ai) => {
         const st = state.accounts?.[a.id] || {};
         const gSched = getGroupSchedule(state, a.groupId || 'group-default');
         const isDuty = gSched.dutyAccountId === a.id || state.dutyAccountId === a.id;
@@ -2168,7 +2288,10 @@ export default {
           keepAlive: resolveKeepAlive(a, cfg),
           duty: isDuty,
           exhausted: !!st.exhausted, reason: st.reason || '',
-          trafficGb: st.trafficGb ?? null, breakdown: st.breakdown || [],
+          trafficGb: (live && live[ai]?.ok) ? live[ai].gb : (st.trafficGb ?? null),
+          breakdown: (live && live[ai]?.ok) ? live[ai].breakdown : (st.breakdown || []),
+          trafficLive: live ? !!live[ai]?.ok : false,
+          trafficLiveError: (live && !live[ai]?.ok) ? (live[ai]?.error || '实时查询失败') : null,
           billAccountAmount: st.billAmount ?? null,
           billInstanceAmount: st.billInstanceAmount ?? null,
           billCurrency: st.billCurrency || null,
@@ -2193,6 +2316,10 @@ export default {
         transition: state.transition,
         fault: state.fault,
         lastTrafficCheck: state.lastTrafficCheck,
+        liveAttempted: !!live,
+        kvWrites: num(state.kvBudget?.writes, 0),
+        kvWriteCap: WRITE_BUDGET_PER_DAY,
+        kvWritesDate: state.kvBudget?.date || null,
         accounts,
         logs: logs.slice(0, 60),
         config: withLiveIps(publicConfig(cfg, env), state),
@@ -3038,6 +3165,14 @@ function renderStatus(){
   else if (duty) line.textContent = '当班：' + duty.name + ' · 上次巡检 ' + (ago || '—') + (clock ? '（' + clock + '）' : '');
   else if (ago) line.textContent = '上次巡检 ' + ago + (clock ? '（' + clock + '）' : '');
   else line.textContent = '等待首次巡检';
+  // KV 免费额度 1000 写/天，展示今日已用，便于提前发现要超
+  if (STATE.kvWriteCap) line.textContent += ' · KV 写 ' + (STATE.kvWrites || 0) + '/' + STATE.kvWriteCap;
+  // 流量是面板现查 CDT 的实时值（不落盘），拿不到时退回巡检快照
+  if (STATE.liveAttempted) {
+    const liveTotal = (STATE.accounts || []).filter(a => a.configured).length;
+    const liveOk = (STATE.accounts || []).filter(a => a.trafficLive).length;
+    line.textContent += liveOk ? (' · 流量实时 ' + liveOk + '/' + liveTotal) : ' · 实时流量获取失败（显示巡检快照）';
+  }
 
   const fb = document.getElementById('faultBanner');
   if (STATE.fault) {
@@ -3050,8 +3185,8 @@ function renderStatus(){
   document.getElementById('fuseBanner').classList.toggle('hidden', !STATE.fused);
 }
 
-async function refresh(){
-  const data = await api('/api/state');
+async function refresh(live){
+  const data = await api('/api/state' + (live ? '?live=1' : ''));
   STATE = data; CFG = data.config;
   renderStatus(); renderAccounts(); renderLogs();
 }
@@ -3567,7 +3702,7 @@ function accountRow(a){
 (async function init(){
   try {
     const a = await api('/api/auth');
-    if (a.authenticated) { showApp(); await refresh(); setInterval(refresh, 30000); }
+    if (a.authenticated) { showApp(); await refresh(true); setInterval(() => { if (!document.hidden) refresh(true); }, 30000); }
     else showLogin();
   } catch(e){ showLogin(); }
 })();
@@ -3585,4 +3720,5 @@ function accountRow(a){
   evaluateExhausted, validateConfig, bssEndpoint, maybeDailyReport,
   probeBilling, listEips, sanitizeConfig, reconcileAndClearFault, renderHtml,
   normalizeHHMM, resetStateWithNotify,
+  appendLog, readLogs, keySignature,
 };
