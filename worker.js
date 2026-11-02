@@ -27,8 +27,8 @@ const REQUEST_TIMEOUT_MS = 10000;
 // 否则 25s × 3 次 × 3 个调用会把一轮 cron 拖到分钟级。
 const BSS_TIMEOUT_MS = 15000;
 const BSS_ATTEMPTS = 2;
-// 一轮账单阶段的总预算，超过就跳过剩余账号，避免 cron 越跑越久
-const BSS_PHASE_BUDGET_MS = 120000;
+// 账单故障自愈的重查间隔：故障持续时每轮都重查会拖长单轮并每轮多一次写
+const BILL_FAULT_RETRY_MS = 10 * 60 * 1000;
 // cron 每分钟一轮：单轮软预算必须明显小于 60 秒，否则相邻两轮会重叠并互相覆盖 state。
 const CRON_SOFT_BUDGET_MS = 45000;
 // 单个账号的账单查询（账号账单 + 实例账单 + 余额）预算，超出则留到下轮
@@ -2056,41 +2056,55 @@ async function tryAutoClearFault(env, cfg, state, engine) {
     return clear('半配置实例已改为排除调度，ACCOUNT_NOT_CONFIGURED 不再适用');
   }
 
-  // 账单故障：阈值已关闭就自愈；仍开启则现场重查一次，成功即解除
+  // 账单故障：阈值已关闭就自愈；仍开启则节流重查，每轮只查一个账号
   if (fault.code === 'BILL_QUERY_FAILED') {
     const targets = cfg.accounts.filter((a) => isConfigured(a) && resolveBillThreshold(a, cfg) > 0);
     if (!targets.length) {
       return clear('账单阈值已关闭，BILL_QUERY_FAILED 不再适用');
     }
-    const now = bjNow();
-    const results = [];
-    const phaseStart = Date.now();
-    for (const acc of targets) {
-      if (Date.now() - phaseStart > BSS_PHASE_BUDGET_MS) {
-        results.push({ acc, bill: { ok: false, error: '本轮耗时超预算，稍后重试' } });
-        continue;
-      }
-      results.push({ acc, bill: await queryBillSafe(acc, { cycle: now.month }) });
-    }
-    const failed = results.filter((r) => !r.bill.ok);
-    if (failed.length) {
-      // 这里是多账号场景，account 留空：不拿它给任何单一账号兜底
-      state.lastBillAttempt = billAttempt(false,
-        failed.map((r) => `${r.acc.name}: ${r.bill.error || '账单不可用'}`).join('; '), null, 0);
+
+    // 节流：故障持续时不能每轮都重查——既会拖长单轮，也会每轮都写一次 KV。
+    // 失败后至少等 BILL_FAULT_RETRY_MS 再试，写入因此被限制在 1 次 / 10 分钟。
+    if (Date.now() - num(state.lastBillAttempt?.at, 0) < BILL_FAULT_RETRY_MS) return false;
+
+    // 每轮只查一个账号（单账号最坏 15s × 2 = 30s，天然在 45s 软预算内）：
+    // 优先查仍标记为失败的，扫完一轮就能判断是否全部恢复。
+    const pending = targets.filter((a) => state.accounts?.[a.id]?.billOk === false);
+    const acc = (pending.length ? pending : targets)[0];
+    const bill = await queryBillSafe(acc, { cycle: bjNow().month });
+
+    if (!bill.ok) {
+      // 失败也要更新 lastBillAttempt（否则节流永远不生效），但这已是本轮唯一一次写
+      state.lastBillAttempt = billAttempt(false, `${acc.name}: ${bill.error || '账单不可用'}`, acc.name, 0);
       await engine.saveState(state);
       return false;
     }
-    for (const { acc, bill } of results) {
-      state.accounts = state.accounts || {};
-      state.accounts[acc.id] = {
-        ...(state.accounts[acc.id] || {}),
-        billAmount: bill.amount,
-        billCurrency: bill.currency,
-        billOk: true,
-        billError: null,
+
+    // 成功：刷新该账号金额，再看是否还有别的账号未恢复
+    state.accounts = state.accounts || {};
+    state.accounts[acc.id] = {
+      ...(state.accounts[acc.id] || {}),
+      billAmount: bill.amount,
+      billCurrency: bill.currency,
+      billOk: true,
+      billError: null,
+    };
+    const stillFailed = targets.filter((a) => a.id !== acc.id && state.accounts[a.id]?.billOk === false);
+    if (stillFailed.length) {
+      // billOk 是关键字段，必须立即落盘。这里保留原来的 at：
+      // 刚成功查过一个账号说明 API 是通的，下一轮应立刻接着查剩下的，不该再等 10 分钟。
+      state.lastBillAttempt = {
+        ...(state.lastBillAttempt || {}),
+        ok: false,
+        error: stillFailed.map((a) => `${a.name}: 待重查`).join('; '),
+        account: null,
+        skipped: 0,
       };
+      await engine.saveState(state);
+      return false;
     }
-    state.lastBillAttempt = billAttempt(true, null, null, 0);
+
+    state.lastBillAttempt = billAttempt(true, null, acc.name, 0);
     // 刚查过账号级账单，同步推进节流时间，避免同一轮再查一遍
     state.lastBillCheck = Date.now();
     return clear('账单查询已恢复，BILL_QUERY_FAILED 自动清除');

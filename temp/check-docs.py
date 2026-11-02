@@ -1,6 +1,13 @@
 """交叉校验：文档里的故障码 / 配置项 / 默认值 / 范围 / RAM 动作 必须与 worker.js 一致。"""
 import re, sys, pathlib
 
+# Windows 控制台默认 GBK，输出 ✓ / ✗ 会抛 UnicodeEncodeError 并以 exit 1 退出，
+# 让人误以为校验失败。这里强制用 UTF-8 输出，失败则退回 ASCII 标记。
+try:
+    sys.stdout.reconfigure(encoding='utf-8')
+except Exception:
+    pass
+
 root = pathlib.Path(__file__).resolve().parent.parent
 src = (root / 'worker.js').read_text(encoding='utf-8')
 readme_path = root / 'README.md' if (root / 'README.md').exists() else root / 'README-CDT-Monitor.md'

@@ -2032,5 +2032,67 @@ console.log('\n[27] 账单跨轮分摊、展示字段降频、日写入预算');
   check('上一轮结束后可以正常执行', !r3.skipped && !r3.error, r3);
 }
 
+{
+  // 账单故障自愈：节流写入 + 每轮只查一个账号
+  resetWorld();
+  const accounts = [acc('bf1'), acc('bf2')];
+  seed(accounts, 'i-bf1');
+  world.bill = {};                 // 两个账号都查不到账单 → NotApplicable → 失败
+  const cfg = baseConfig(accounts);
+  cfg.system.billThreshold = 5;
+  const mkState = () => ({
+    ...defaultState(), month: cstMonth(),
+    fault: { code: 'BILL_QUERY_FAILED', at: new Date().toISOString(), message: '账单查询失败' },
+    accounts: { bf1: { billOk: false, billError: 'x' }, bf2: { billOk: false, billError: 'y' } },
+  });
+  const store = { app_config: JSON.stringify(cfg), app_logs: '[]', state_v2: JSON.stringify(mkState()) };
+  let puts = 0;
+  const env = {
+    store,
+    STATE_KV: {
+      async get(k, opts) { const v = store[k]; if (v === undefined) return null; return opts?.type === 'json' ? JSON.parse(v) : v; },
+      async put(k, v) { if (k === 'state_v2') puts++; store[k] = v; },
+      async delete(k) { delete store[k]; },
+    },
+  };
+
+  await executeCron(env);
+  check('账单故障自愈每轮只查 1 个账号', world.billCalls.length === 1, world.billCalls);
+  check('首轮失败写入 1 次（更新 lastBillAttempt 以启动节流）', puts === 1, puts);
+
+  puts = 0;
+  world.billCalls = [];
+  await executeCron(env);
+  await executeCron(env);
+  check('节流窗口内不再重查账单', world.billCalls.length === 0, world.billCalls);
+  check('节流窗口内不写 KV（故障持续时不再 1440 写/天）', puts === 0, puts);
+
+  // 超过 10 分钟：重查一次
+  timeOffset += 10 * 60 * 1000 + 1000;
+  world.billCalls = [];
+  puts = 0;
+  await executeCron(env);
+  check('超过 10 分钟重查一次', world.billCalls.length === 1, world.billCalls);
+
+  // 部分恢复：bf1 成功、bf2 仍失败 → 保留故障，bf1.billOk 立即落盘
+  timeOffset += 10 * 60 * 1000 + 1000;   // 上一次失败写入已开启节流，等过窗口再试
+  world.bill = { 'ak-bf1': 3 };
+  world.billCalls = [];
+  await executeCron(env);
+  check('部分恢复时只查一个账号', world.billCalls.length === 1, world.billCalls);
+  let mid = JSON.parse(store.state_v2);
+  check('部分恢复时 bf1.billOk 已落盘为 true', mid.accounts.bf1.billOk === true, mid.accounts.bf1.billOk);
+  check('部分恢复时故障仍然保留', mid.fault?.code === 'BILL_QUERY_FAILED', mid.fault?.code);
+
+  // 下一轮立刻查剩下的账号（成功过就不再等 10 分钟）
+  world.bill = { 'ak-bf1': 3, 'ak-bf2': 4 };
+  world.billCalls = [];
+  await executeCron(env);
+  check('成功一次后下一轮立刻接着查', world.billCalls.length === 1 && world.billCalls[0].endsWith(':ak-bf2'), world.billCalls);
+  const cleared = JSON.parse(store.state_v2);
+  check('全部恢复后故障自动解除', !cleared.fault, cleared.fault);
+  timeOffset = 0;
+}
+
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);
