@@ -202,6 +202,11 @@ function cstDate() {
     .format(new Date());
 }
 
+// KV 免费额度按 UTC 00:00 重置，写入预算的「日」也用 UTC
+function utcDate() {
+  return new Date().toISOString().slice(0, 10);
+}
+
 let pass = 0, fail = 0;
 function check(name, cond, extra) {
   if (cond) { pass++; console.log('  PASS  ' + name); }
@@ -1749,7 +1754,7 @@ console.log('\n[27] 账单跨轮分摊、展示字段降频、日写入预算');
   // ---- 日写入预算
   resetWorld();
   world.bill = {};
-  h = mkEnv({ ...baseSt(), lastDisplayPersistAt: 0, kvBudget: { date: cstDate(), writes: 750, cappedAt: null } });
+  h = mkEnv({ ...baseSt(), lastDisplayPersistAt: 0, kvBudget: { date: utcDate(), writes: 750, cappedAt: null } });
   await executeCron(h.env);          // 初始化
   await executeCron(h.env);          // 记下 cappedAt 并告警
   h.box.putCount = 0;
@@ -1762,11 +1767,49 @@ console.log('\n[27] 账单跨轮分摊、展示字段降频、日写入预算');
   world.bill = { 'ak-th1': 5, 'ak-th2': 7 };
   h = mkEnv({
     ...baseSt(), lastBillCheck: Date.now() - 31 * 60000, lastDisplayPersistAt: Date.now(),
-    kvBudget: { date: cstDate(), writes: 900, cappedAt: new Date().toISOString() },
+    kvBudget: { date: utcDate(), writes: 900, cappedAt: new Date().toISOString() },
   });
   h.box.putCount = 0;
   await executeCron(h.env);
   check('预算耗尽时关键字段仍然照常落盘', h.box.putCount === 1, h.box.putCount);
+
+  // ---- 跨 UTC 日：昨天预算已用尽，今天展示字段必须能重新落盘
+  resetWorld();
+  world.bill = {};
+  const yesterday = new Date(Date.now() - 24 * 3600 * 1000).toISOString().slice(0, 10);
+  h = mkEnv({
+    ...baseSt(), lastDisplayPersistAt: 0,
+    kvBudget: { date: yesterday, writes: 800, cappedAt: new Date(Date.now() - 24 * 3600 * 1000).toISOString() },
+  });
+  h.box.putCount = 0;
+  await executeCron(h.env);
+  check('昨天的预算耗尽不会冻结今天的展示字段', h.box.putCount === 1, h.box.putCount);
+  const todayBudget = JSON.parse(h.store.state_v2).kvBudget;
+  check('预算计数已切到当前 UTC 日', todayBudget.date === utcDate(), todayBudget);
+  check('新一天预算重置（cappedAt 清空）', todayBudget.cappedAt === null, todayBudget);
+}
+
+{
+  // 没有实例时不应每轮都写 state（否则每分钟 cron = 1440 写/天）
+  resetWorld();
+  const cfg = baseConfig([]);
+  const store = { app_config: JSON.stringify(cfg), app_logs: '[]' };
+  let putCount = 0;
+  const env = {
+    store,
+    STATE_KV: {
+      async get(k, opts) { const v = store[k]; if (v === undefined) return null; return opts?.type === 'json' ? JSON.parse(v) : v; },
+      async put(k, v) { if (k === 'state_v2') putCount++; store[k] = v; },
+      async delete(k) { delete store[k]; },
+    },
+  };
+  await executeCron(env);            // 首轮：跨月重置，会写一次
+  putCount = 0;
+  await executeCron(env);
+  check('无实例时稳态不写 state_v2', putCount === 0, putCount);
+  await executeCron(env);
+  check('无实例时连续多轮仍然不写', putCount === 0, putCount);
+  check('无实例时首次状态已落盘（month 已写入）', JSON.parse(store.state_v2).month === cstMonth(), JSON.parse(store.state_v2).month);
 }
 
 {
@@ -1798,6 +1841,24 @@ console.log('\n[27] 账单跨轮分摊、展示字段降频、日写入预算');
   check('面板 ?live=1 标记 trafficLive', data.accounts[0].trafficLive === true, data.accounts[0].trafficLive);
   check('面板 ?live=1 标记 liveAttempted', data.liveAttempted === true, data.liveAttempted);
   check('面板 ?live=1 不产生 KV 写', putCount === 0, putCount);
+
+  // 实时查询失败时：回退快照值，并在每张卡片上给出失败原因
+  store.state_v2 = JSON.stringify({
+    ...defaultState(), month: cstMonth(),
+    accounts: { lv1: { trafficGb: 3.25, breakdown: [{ region: 'cn-hongkong', gb: 3.25 }] } },
+  });
+  world.failCdt.add('ak-lv1');
+  const res2 = await M.default.fetch(new Request('https://w.dev/api/state?live=1', { headers: { Cookie: `cdt_session=${token}` } }), env);
+  const data2 = await res2.json();
+  check('实时查询失败时回退到巡检快照值', data2.accounts[0].trafficGb === 3.25, data2.accounts[0].trafficGb);
+  check('实时查询失败时 trafficLive 为 false', data2.accounts[0].trafficLive === false, data2.accounts[0].trafficLive);
+  check('实时查询失败时给出原因', typeof data2.accounts[0].trafficLiveError === 'string' && data2.accounts[0].trafficLiveError.length > 0, data2.accounts[0].trafficLiveError);
+  world.failCdt.delete('ak-lv1');
+
+  // 面板状态行文案：降频后不能再说「上次巡检 N 分钟前」
+  const html = await (await M.default.fetch(new Request('https://w.dev/'), env)).text();
+  check('状态行改为「数据更新」文案', html.includes('数据更新'), html.includes('上次巡检'));
+  check('状态行不再输出「· 上次巡检」', !html.includes('· 上次巡检'), true);
 }
 
 {
@@ -1879,6 +1940,49 @@ console.log('\n[27] 账单跨轮分摊、展示字段降频、日写入预算');
   res = await M.default.fetch(H('/api/logout', 'POST', null, `cdt_session=${token}`), env);
   check('登出后 KV 会话被删除', store[kvKey] === undefined, store[kvKey]);
   check('登出清空 Cookie', /Max-Age=0/.test(res.headers.get('Set-Cookie') || ''), res.headers.get('Set-Cookie'));
+}
+
+{
+  // 账单故障文案不串号、lastBillAttempt 字段齐全
+  resetWorld();
+  const accounts = [acc('bm1'), acc('bm2')];
+  seed(accounts, 'i-bm1');
+  const cfg = baseConfig(accounts, [{ id: 'g-bm', name: '账单组', rotationIntervalMinutes: 0, cf: { enabled: false } }]);
+  cfg.system.billThreshold = 5;
+  const st = {
+    ...defaultState(), month: cstMonth(), lastBillCheck: Date.now(),
+    accounts: {
+      bm1: { billOk: false, billError: null, exhausted: false },
+      bm2: { billOk: true, billError: null, exhausted: false },
+    },
+    // 上一轮的结果属于 bm2，不能拿来给 bm1 兜底
+    lastBillAttempt: { at: Date.now(), ok: false, error: 'bm2: 旧错误', account: 'bm2', skipped: 0 },
+  };
+  const store = { app_config: JSON.stringify(cfg), app_logs: '[]', state_v2: JSON.stringify(st) };
+  const env = {
+    store,
+    STATE_KV: {
+      async get(k, opts) { const v = store[k]; if (v === undefined) return null; return opts?.type === 'json' ? JSON.parse(v) : v; },
+      async put(k, v) { store[k] = v; },
+      async delete(k) { delete store[k]; },
+    },
+  };
+  await executeCron(env);
+  const after = JSON.parse(store.state_v2);
+  check('账单故障已触发', after.fault?.code === 'BILL_QUERY_FAILED', after.fault);
+  check('故障文案不会串到其他账号的错误',
+    (after.fault?.message || '').includes('BM1') && !(after.fault?.message || '').includes('旧错误'), after.fault?.message);
+
+  // 本轮真的查了账单时，lastBillAttempt 必须标记归属账号
+  resetWorld();
+  seed(accounts, 'i-bm1');
+  world.bill = { 'ak-bm1': 1 };
+  const st2 = { ...defaultState(), month: cstMonth(), lastBillCheck: Date.now() - 31 * 60000 };
+  store.state_v2 = JSON.stringify(st2);
+  await executeCron(env);
+  const after2 = JSON.parse(store.state_v2);
+  check('lastBillAttempt 带 account 字段', after2.lastBillAttempt?.account === '账号 BM1', after2.lastBillAttempt);
+  check('lastBillAttempt 带 skipped 字段', after2.lastBillAttempt?.skipped === 0, after2.lastBillAttempt);
 }
 
 console.log(`\n${pass} passed, ${fail} failed`);

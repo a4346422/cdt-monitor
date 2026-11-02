@@ -33,6 +33,9 @@ const BSS_PHASE_BUDGET_MS = 120000;
 const CRON_SOFT_BUDGET_MS = 45000;
 // 单个账号的账单查询（账号账单 + 实例账单 + 余额）预算，超出则留到下轮
 const BILL_ACCOUNT_BUDGET_MS = 35000;
+// 面板实时流量查询预算：单次 4 秒、不重试、整批最多 8 秒
+const LIVE_QUERY_TIMEOUT_MS = 4000;
+const LIVE_QUERY_BUDGET_MS = 8000;
 // 展示字段（流量/账单金额/余额/时间戳等）的落盘周期：关键字段不受它限制
 const DISPLAY_PERSIST_MS = 10 * 60 * 1000;
 // 每日 state 写入硬上限：耗尽后只停写展示字段，关键状态照常写入
@@ -316,12 +319,14 @@ function quotaForClass(cls) {
 
 // ---------------------------------------------------------------- CDT 流量
 
-async function getCdtTraffic(acc) {
+// opts.timeoutMs / opts.attempts 用于面板的实时查询：必须比 cron 采集更短，
+// 否则面板 30 秒轮询会与阿里云抖动叠加成数十秒的请求堆积。
+async function getCdtTraffic(acc, opts = {}) {
   try {
     const res = await callAliyun('cdt.aliyuncs.com', 'cn-hongkong', {
       Action: 'ListCdtInternetTraffic',
       Version: '2021-08-13',
-    }, acc.ak, acc.sk);
+    }, acc.ak, acc.sk, opts.timeoutMs || REQUEST_TIMEOUT_MS, opts.attempts || RETRY_ATTEMPTS);
 
     const rows = res.TrafficDetails;
     if (!Array.isArray(rows) || rows.length === 0) {
@@ -1003,14 +1008,30 @@ function syncLegacyStateView(state, cfg) {
 
 // ---------------------------------------------------------------- 写入节流
 
+// KV 免费额度按 UTC 00:00 重置，所以预算的「日」必须用 UTC，不能用北京日期，
+// 否则同一个 UTC 配额日内会跨两个北京日、计数被重置一次，实际上限翻倍。
+function kvQuotaDay(nowMs = Date.now()) {
+  return new Date(nowMs).toISOString().slice(0, 10);
+}
+
+// 统一构造 lastBillAttempt：字段齐全，且 account 标记本次结果属于哪个账号，
+// 避免故障文案把 A 账号的错误串到 B 账号上。
+function billAttempt(ok, error, account = null, skipped = 0) {
+  return { at: Date.now(), ok, error: error || null, account, skipped };
+}
+
 // 每日写入计数：在 saveState 里自增，跟着 state 一起落盘，不产生额外写
 function bumpWriteBudget(state) {
-  const today = bjNow().date;
+  const today = kvQuotaDay();
   if (!state.kvBudget || state.kvBudget.date !== today) {
     state.kvBudget = { date: today, writes: 0, cappedAt: null };
   }
   state.kvBudget.writes = num(state.kvBudget.writes, 0) + 1;
 }
+
+// 本轮是否已经写过 state：用对象身份标记，不用写入计数比较
+// （计数跨 UTC 日会归零，`1 > 800` 会误判为「没写过」）
+const wroteThisRound = new WeakSet();
 
 // 关键字段签名：一变就必须立即落盘，绝不能被展示字段的降频拖住。
 // 只收录「有实际值」的条目：否则首次填充展示字段（trafficGb 等）也会被当成关键变化。
@@ -1047,14 +1068,18 @@ async function persistStateIfNeeded(env, engine, state, opts) {
   if (opts.wroteInRound) return false;          // 本轮已经写过，不重复写
   if (opts.keyChanged) { await engine.saveState(state); return true; }
 
-  const budget = state.kvBudget || {};
+  // 预算计数只对「本 UTC 日」有效：昨天的计数不能冻结今天的展示字段
+  const budget = (state.kvBudget && state.kvBudget.date === kvQuotaDay())
+    ? state.kvBudget
+    : { date: kvQuotaDay(), writes: 0, cappedAt: null };
+  state.kvBudget = budget;
   if (num(budget.writes, 0) >= WRITE_BUDGET_PER_DAY) {
     if (!budget.cappedAt) {
       // 只告警一次：记下时间并落盘，否则每轮都会重复写日志
       budget.cappedAt = new Date().toISOString();
       await engine.saveState(state);
       await appendLogSafe(env, 'WARN', 'KV 写入预算已用尽',
-        `今日已写 ${budget.writes} 次，展示字段停止落盘（关键状态仍照常写入）。如需更频繁刷新请升级 Workers Paid。`);
+        `今日（UTC ${budget.date}）已写 ${budget.writes} 次，展示字段停止落盘（关键状态仍照常写入）。如需更频繁刷新请升级 Workers Paid。`);
     }
     return false;
   }
@@ -1157,8 +1182,8 @@ async function runEngineCron(env, engine, preCfg, preState, actions = null) {
   const state = preState || await engine.loadState();
   const now = bjNow();
   const runStart = Date.now();
-  const writesBefore = num(state.kvBudget?.writes, 0);
   const keySigBefore = keySignature(state);
+  wroteThisRound.delete(state);
 
   // ---- 跨月：所有账号额度恢复
   if (state.month !== now.month) {
@@ -1175,9 +1200,9 @@ async function runEngineCron(env, engine, preCfg, preState, actions = null) {
   // 故障时先看触发条件是否已经不成立（比如实例被释放后用户已把它从配置里删掉）
   if (state.fault) await tryAutoClearFault(env, cfg, state, engine);
 
-  // 没有任何实例是正常状态（用户还没添加），不是故障
+  // 没有任何实例是正常状态（用户还没添加），不是故障。
+  // 这里不主动落盘：交给 finally 按变更判断，否则每分钟 cron 会白白写 1440 次/天。
   if (!Array.isArray(cfg.accounts) || cfg.accounts.length === 0) {
-    await engine.saveState(state);
     return { skipped: true, reason: 'no_accounts' };
   }
 
@@ -1260,13 +1285,7 @@ async function runEngineCron(env, engine, preCfg, preState, actions = null) {
 
       // 记录本轮结果：面板和故障自愈都靠它，不再被下一轮“未查询”覆盖
       const billFailures = account.ok ? [] : [`${acc.name}: ${account.error || '账单不可用'}`];
-      state.lastBillAttempt = {
-        at: Date.now(),
-        ok: billFailures.length === 0,
-        error: billFailures.join('; ') || null,
-        account: acc.name,
-        skipped: 0,
-      };
+      state.lastBillAttempt = billAttempt(billFailures.length === 0, billFailures.join('; '), acc.name, 0);
       if (billFailures.length) await appendLogSafe(env, 'WARN', '账单查询失败', billFailures.join('; '));
 
       // 游标推进；扫完最后一个账号即结束本窗口，billCheckMinutes 后再开新窗口
@@ -1325,7 +1344,12 @@ async function runEngineCron(env, engine, preCfg, preState, actions = null) {
   const billFailures = cfg.accounts
     .filter((a) => isConfigured(a) && resolveBillThreshold(a, cfg) > 0)
     .filter((a) => state.accounts[a.id]?.billOk === false)
-    .map((a) => `${a.name}: ${state.accounts[a.id].billError || state.lastBillAttempt?.error || '账单不可用'}`);
+    .map((a) => {
+      const st = state.accounts[a.id] || {};
+      // 只有本轮结果确实属于这个账号时才用它兜底，否则会串号
+      const fallback = state.lastBillAttempt?.account === a.name ? state.lastBillAttempt.error : null;
+      return `${a.name}: ${st.billError || fallback || '账单不可用'}`;
+    });
   if (billFailures.length) {
     return setFault(env, engine, state, 'BILL_QUERY_FAILED', billFailures.join('; '));
   }
@@ -1499,7 +1523,7 @@ async function runEngineCron(env, engine, preCfg, preState, actions = null) {
     syncLegacyStateView(state, cfg);
     await persistStateIfNeeded(env, engine, state, {
       keyChanged: keySignature(state) !== keySigBefore,
-      wroteInRound: num(state.kvBudget?.writes, 0) > writesBefore,
+      wroteInRound: wroteThisRound.has(state),
     });
   }
   return cronResult;
@@ -1922,6 +1946,7 @@ function getEngine(env) {
     },
     async saveState(state) {
       bumpWriteBudget(state);
+      wroteThisRound.add(state);
       await env.STATE_KV.put('state_v2', JSON.stringify(state));
     },
     async resetState() {
@@ -2034,11 +2059,9 @@ async function tryAutoClearFault(env, cfg, state, engine) {
     }
     const failed = results.filter((r) => !r.bill.ok);
     if (failed.length) {
-      state.lastBillAttempt = {
-        at: Date.now(),
-        ok: false,
-        error: failed.map((r) => `${r.acc.name}: ${r.bill.error || '账单不可用'}`).join('; '),
-      };
+      // 这里是多账号场景，account 留空：不拿它给任何单一账号兜底
+      state.lastBillAttempt = billAttempt(false,
+        failed.map((r) => `${r.acc.name}: ${r.bill.error || '账单不可用'}`).join('; '), null, 0);
       await engine.saveState(state);
       return false;
     }
@@ -2052,7 +2075,7 @@ async function tryAutoClearFault(env, cfg, state, engine) {
         billError: null,
       };
     }
-    state.lastBillAttempt = { at: Date.now(), ok: true, error: null, skipped: 0 };
+    state.lastBillAttempt = billAttempt(true, null, null, 0);
     // 刚查过账号级账单，同步推进节流时间，避免同一轮再查一遍
     state.lastBillCheck = Date.now();
     return clear('账单查询已恢复，BILL_QUERY_FAILED 自动清除');
@@ -2265,10 +2288,15 @@ export default {
       // 面板打开时的「实时」流量：现查一次 CDT 直接返回，不写 KV。
       // 降频落盘只影响 KV 里的快照，不影响这里的实时展示。
       const wantLive = url.searchParams.get('live') === '1';
+      // 实时查询走更短预算（单次 4s、不重试、整批最多 8s），避免面板轮询堆积
       const live = wantLive
-        ? await Promise.all(cfg.accounts.map((a) => (isConfigured(a)
-          ? getCdtTraffic(a).catch((e) => ({ ok: false, error: e.message }))
-          : Promise.resolve({ ok: false, skipped: true, error: '未配置完整' }))))
+        ? await Promise.race([
+          Promise.all(cfg.accounts.map((a) => (isConfigured(a)
+            ? getCdtTraffic(a, { timeoutMs: LIVE_QUERY_TIMEOUT_MS, attempts: 1 })
+              .catch((e) => ({ ok: false, error: e.message }))
+            : Promise.resolve({ ok: false, skipped: true, error: '未配置完整' })))),
+          new Promise((resolve) => setTimeout(() => resolve(null), LIVE_QUERY_BUDGET_MS)),
+        ])
         : null;
       const accounts = cfg.accounts.map((a, ai) => {
         const st = state.accounts?.[a.id] || {};
@@ -2289,7 +2317,9 @@ export default {
           trafficGb: (live && live[ai]?.ok) ? live[ai].gb : (st.trafficGb ?? null),
           breakdown: (live && live[ai]?.ok) ? live[ai].breakdown : (st.breakdown || []),
           trafficLive: live ? !!live[ai]?.ok : false,
-          trafficLiveError: (live && !live[ai]?.ok) ? (live[ai]?.error || '实时查询失败') : null,
+          trafficLiveError: (live && !live[ai]?.ok)
+            ? (live[ai]?.error || '实时查询失败')
+            : (wantLive && !live ? '实时查询超时，显示巡检快照' : null),
           billAccountAmount: st.billAmount ?? null,
           billInstanceAmount: st.billInstanceAmount ?? null,
           billCurrency: st.billCurrency || null,
@@ -2315,7 +2345,7 @@ export default {
         fault: state.fault,
         lastTrafficCheck: state.lastTrafficCheck,
         liveAttempted: !!live,
-        kvWrites: num(state.kvBudget?.writes, 0),
+        kvWrites: state.kvBudget?.date === kvQuotaDay() ? num(state.kvBudget?.writes, 0) : 0,
         kvWriteCap: WRITE_BUDGET_PER_DAY,
         kvWritesDate: state.kvBudget?.date || null,
         accounts,
@@ -2886,7 +2916,7 @@ async function doLogin(){
   err.classList.add('hidden');
   try {
     await api('/api/login', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ password }) });
-    showApp(); await refresh();
+    showApp(); await refresh(true);
   } catch(e){ err.textContent = e.message; err.classList.remove('hidden'); }
 }
 
@@ -2954,7 +2984,7 @@ async function act(action){
     else if (r && r.halted) toast('🚨 已进入保护状态：' + (r.fault?.code || ''), 'error');
     else if (r && r.error) toast('❌ ' + r.error, 'error');
     else toast('操作已提交', 'info');
-    await refresh();
+    await refresh(true);
   } catch(e){ toast('❌ ' + e.message, 'error'); }
   finally { if (btn) { btn.disabled = false; btn.textContent = label; } }
 }
@@ -3096,6 +3126,7 @@ function renderCardHtml(a){
     + (a.ecsError ? '<p class="text-[10px] text-rose-600">' + esc(a.ecsError) + '</p>' : '')
     + '<div>'
     +   '<div class="flex justify-between text-[11px] mb-1"><span class="text-zinc-500">流量</span><span class="font-bold text-zinc-800">' + (a.trafficGb ?? '-') + ' / ' + a.quota + ' GB（限额）</span></div>'
+    +   (a.trafficLiveError ? '<p class="text-[10px] text-amber-600 mb-1">实时流量：' + esc(a.trafficLiveError) + '（显示上次巡检值）</p>' : '')
     +   '<div class="relative h-1.5 rounded-full bg-zinc-200 overflow-hidden"><div class="h-full ' + barColor(qp) + '" style="width:' + qp + '%"></div>'
     +     (thresholdMark != null ? '<div class="absolute top-0 h-full w-0.5 bg-zinc-800" style="left:' + thresholdMark + '%"></div>' : '')
     +   '</div>'
@@ -3155,18 +3186,25 @@ function renderStatus(){
   const last = STATE.lastTrafficCheck && STATE.lastTrafficCheck.at;
   const ago = last ? relTime(last) : null;
   const clock = last ? last.slice(0,16).replace('T',' ') : null;
-  if (STATE.fused) line.textContent = '本月全部账号额度耗尽' + (ago ? ' · 上次巡检 ' + ago : '');
-  else if (duty) line.textContent = '当班：' + duty.name + ' · 上次巡检 ' + (ago || '—') + (clock ? '（' + clock + '）' : '');
-  else if (ago) line.textContent = '上次巡检 ' + ago + (clock ? '（' + clock + '）' : '');
-  else line.textContent = '等待首次巡检';
-  // KV 免费额度 1000 写/天，展示今日已用，便于提前发现要超
-  if (STATE.kvWriteCap) line.textContent += ' · KV 写 ' + (STATE.kvWrites || 0) + '/' + STATE.kvWriteCap;
+  // 展示字段每 10 分钟才落盘，所以这里写「数据更新」而不是「上次巡检」，
+  // 否则 cron 明明每分钟都在跑，界面却显示 9 分钟前，看起来像掉线。
+  const dataPart = ago ? '数据更新 ' + ago + (clock ? '（' + clock + '）' : '') : null;
+  if (STATE.fused) line.textContent = '本月全部账号额度耗尽' + (dataPart ? ' · ' + dataPart : '');
+  else if (duty) line.textContent = '当班：' + duty.name + (dataPart ? ' · ' + dataPart : ' · 等待首次巡检');
+  else line.textContent = dataPart || '等待首次巡检';
   // 流量是面板现查 CDT 的实时值（不落盘），拿不到时退回巡检快照
+  let liveOk = 0;
+  let liveTotal = 0;
   if (STATE.liveAttempted) {
-    const liveTotal = (STATE.accounts || []).filter(a => a.configured).length;
-    const liveOk = (STATE.accounts || []).filter(a => a.trafficLive).length;
-    line.textContent += liveOk ? (' · 流量实时 ' + liveOk + '/' + liveTotal) : ' · 实时流量获取失败（显示巡检快照）';
+    liveTotal = (STATE.accounts || []).filter(a => a.configured).length;
+    liveOk = (STATE.accounts || []).filter(a => a.trafficLive).length;
+    line.textContent += liveOk
+      ? (' · 流量实时 ' + liveOk + '/' + liveTotal)
+      : ' · 实时流量获取失败（显示快照）';
   }
+  if (!liveOk && ago) line.textContent += ' · 每 10 分钟落盘';
+  // 只统计 state_v2 的写入（日志/会话/配置不计入），所以写成「状态写入」而不是「KV 写」
+  if (STATE.kvWriteCap) line.textContent += ' · 状态写入 ' + (STATE.kvWrites || 0) + '/' + STATE.kvWriteCap;
 
   const fb = document.getElementById('faultBanner');
   if (STATE.fault) {
@@ -3229,7 +3267,7 @@ async function onDrop(e, targetGroupId) {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ ...CFG, accounts: CFG.accounts })
     });
-    await refresh();
+    await refresh(true);
   } catch(err) {
     alert('移动分组失败: ' + err.message);
   }
@@ -3290,7 +3328,7 @@ async function saveGlobalSettings(){
   try {
     await api('/api/config', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(payload) });
     closeGlobalSettings();
-    await refresh();
+    await refresh(true);
   } catch(e){ alert('保存失败: ' + e.message); }
 }
 
@@ -3427,7 +3465,7 @@ async function saveGroups(){
       body: JSON.stringify({ ...CFG, groups: CFG.groups, accounts: CFG.accounts })
     });
     closeGroupModal();
-    await refresh();
+    await refresh(true);
   } catch(e) {
     alert('保存分组失败: ' + e.message);
   }
@@ -3513,7 +3551,7 @@ async function saveInstanceSettings(){
       body: JSON.stringify({ ...CFG, accounts: CFG.accounts })
     });
     closeInstanceSettings();
-    await refresh();
+    await refresh(true);
   } catch(e) {
     alert('保存失败: ' + e.message);
   }
@@ -3569,7 +3607,7 @@ async function controlInstance(action, accountId, name){
     });
     if (r && r.error) alert(label + '失败: ' + r.error);
     else alert(r?.message || ('已成功发送' + label + '指令'));
-    await refresh();
+    await refresh(true);
   } catch(e) {
     alert(label + '请求出错: ' + e.message);
   }
