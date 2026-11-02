@@ -2051,7 +2051,13 @@ async function reconcileAndClearFault(env, cfg, state, engine) {
 // HTTP 入口
 // ============================================================================
 
-const SESSION_TTL_MS = 12 * 60 * 60 * 1000;
+// 会话策略：Cookie 的物理有效期固定为上限（30 天），真实有效期由 KV 里的 expiresAt 决定。
+// 这样滑动续期只需重写 KV，不必在每个响应里重新下发 Set-Cookie。
+const SESSION_TTL_MS = 12 * 60 * 60 * 1000;                 // 默认 12 小时
+const SESSION_REMEMBER_TTL_MS = 30 * 24 * 60 * 60 * 1000;   // 勾选「记住我」后 30 天
+const SESSION_COOKIE_MAX_AGE = 30 * 24 * 60 * 60;           // Cookie 物理上限（秒）
+const SESSION_RENEW_RATIO = 0.5;                            // 剩余不足一半才续期
+const SESSION_KV_MIN_TTL = 60;                              // KV expirationTtl 下限（秒）
 
 function json(data, status = 200, headers = {}) {
   return new Response(JSON.stringify(data), {
@@ -2067,6 +2073,26 @@ function parseCookies(request) {
     if (i > 0) out[part.slice(0, i).trim()] = decodeURIComponent(part.slice(i + 1).trim());
   }
   return out;
+}
+
+function sessionCookie(token, maxAgeSec) {
+  return `cdt_session=${token}; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=${maxAgeSec}`;
+}
+
+async function putSession(env, token, ttlMs) {
+  const ttlSec = Math.max(SESSION_KV_MIN_TTL, Math.floor(ttlMs / 1000));
+  await env.STATE_KV.put(`session:${token}`, JSON.stringify({
+    expiresAt: Date.now() + ttlMs,
+    ttlMs,
+    at: new Date().toISOString(),
+  }), { expirationTtl: ttlSec });
+}
+
+// 剩余有效期不足一半才重写，把会话续期压到每会话最多 1 次写 / 6 小时（默认 TTL 下）
+async function touchSession(env, session) {
+  const ttlMs = num(session.ttlMs, SESSION_TTL_MS);
+  if (num(session.expiresAt, 0) - Date.now() > ttlMs * SESSION_RENEW_RATIO) return;
+  await putSession(env, session.token, ttlMs);
 }
 
 async function getSession(env, request) {
@@ -2098,10 +2124,12 @@ export default {
         await appendLogSafe(env, 'ERROR', '登录失败', request.headers.get('CF-Connecting-IP') || 'unknown');
         return json({ error: '密码错误' }, 401);
       }
+      const remember = body.remember === true;
+      const ttlMs = remember ? SESSION_REMEMBER_TTL_MS : SESSION_TTL_MS;
       const token = crypto.randomUUID().replace(/-/g, '') + crypto.randomUUID().replace(/-/g, '');
-      await env.STATE_KV.put(`session:${token}`, JSON.stringify({ expiresAt: Date.now() + SESSION_TTL_MS, at: new Date().toISOString() }), { expirationTtl: 43200 });
-      await appendLogSafe(env, 'AUDIT', '登录成功', request.headers.get('CF-Connecting-IP') || 'unknown');
-      return json({ ok: true }, 200, { 'Set-Cookie': `cdt_session=${token}; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=43200` });
+      await putSession(env, token, ttlMs);
+      await appendLogSafe(env, 'AUDIT', '登录成功', `${request.headers.get('CF-Connecting-IP') || 'unknown'}（${remember ? '记住我 30 天' : '默认 12 小时'}）`);
+      return json({ ok: true, remember }, 200, { 'Set-Cookie': sessionCookie(token, SESSION_COOKIE_MAX_AGE) });
     }
 
     if (url.pathname === '/api/logout') {
@@ -2115,7 +2143,10 @@ export default {
     }
 
     // ---- 以下接口都需要登录
-    if (!(await getSession(env, request))) return json({ error: 'Unauthorized' }, 401);
+    const session = await getSession(env, request);
+    if (!session) return json({ error: 'Unauthorized' }, 401);
+    // 活跃即续期：剩余不足一半才重写 KV，避免每个请求都产生一次写
+    await touchSession(env, session);
 
     if (url.pathname === '/api/state') {
       const engine = getEngine(env);
@@ -2525,6 +2556,10 @@ function renderHtml() {
     <h1 class="text-sm font-bold tracking-widest uppercase text-zinc-900">CDT MONITOR</h1>
     <p class="text-xs text-zinc-500">请输入管理员密码</p>
     <input id="loginPass" type="password" placeholder="管理员密码" class="w-full bg-zinc-50 border border-zinc-200 rounded-xl px-3 py-2 text-sm" onkeydown="if(event.key==='Enter')doLogin()">
+    <label class="flex items-center gap-2 text-[11px] text-zinc-600 select-none cursor-pointer">
+      <input id="loginRemember" type="checkbox" class="w-3.5 h-3.5 accent-zinc-900">
+      <span>记住我（30 天，公共设备请勿勾选）</span>
+    </label>
     <button onclick="doLogin()" class="w-full py-2 rounded-xl bg-zinc-900 text-white text-xs font-bold">登录</button>
     <p id="loginErr" class="text-[11px] text-rose-600 hidden"></p>
   </div>
@@ -2725,10 +2760,11 @@ function showApp(){ document.getElementById('loginView').classList.add('hidden')
 
 async function doLogin(){
   const password = document.getElementById('loginPass').value;
+  const remember = !!document.getElementById('loginRemember')?.checked;
   const err = document.getElementById('loginErr');
   err.classList.add('hidden');
   try {
-    await api('/api/login', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ password }) });
+    await api('/api/login', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ password, remember }) });
     showApp(); await refresh();
   } catch(e){ err.textContent = e.message; err.classList.remove('hidden'); }
 }
