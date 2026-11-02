@@ -113,7 +113,7 @@ KV 统一承载状态（`state_v2`）、配置（`app_config`）、会话（`ses
 
 **不迁移旧版本状态。** 首次运行直接给一份干净的状态。
 
-会话 token 同样存在 KV（`session:*`），通过 `HttpOnly; Secure; SameSite=Lax` 的 Cookie 传递：默认 12 小时，勾选「记住我」后 30 天。Cookie 的物理 `Max-Age` 固定为 30 天（上限），真实有效期始终以 KV 里的 `expiresAt` 为准；活跃使用时会自动续期（剩余不足一半才重写 KV，压到每会话最多 1 次写 / 6 小时）。会话过期后接口返回 401，面板自动回到登录页。
+会话 token 同样存在 KV（`session:*`），通过 `HttpOnly; Secure; SameSite=Lax` 的 Cookie 传递。只有一种会话：**7 天滑动有效期**——期间打开面板即自动续期（剩余不足 3.5 天才重写 KV，所以每个会话最多 1 次写 / 3.5 天），连续 7 天不使用则失效。Cookie 的物理 `Max-Age` 固定为 30 天（约 4 倍 TTL），真实有效期始终以 KV 里的 `expiresAt` 为准；续期不重发 Cookie，所以这个上限必须明显大于 TTL。会话过期后接口返回 401，面板自动回到登录页。
 
 ### 3.2 查询失败一律 fail-closed
 

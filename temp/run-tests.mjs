@@ -1790,7 +1790,7 @@ console.log('\n[27] 账单跨轮分摊、展示字段降频、日写入预算');
     },
   };
   const token = 'lv-token';
-  store[`session:${token}`] = JSON.stringify({ expiresAt: Date.now() + 11 * 3600 * 1000, ttlMs: 12 * 3600 * 1000 });
+  store[`session:${token}`] = JSON.stringify({ expiresAt: Date.now() + 6 * 24 * 3600 * 1000, ttlMs: 7 * 24 * 3600 * 1000 });
   putCount = 0;
   const res = await M.default.fetch(new Request('https://w.dev/api/state?live=1', { headers: { Cookie: `cdt_session=${token}` } }), env);
   const data = await res.json();
@@ -1826,7 +1826,7 @@ console.log('\n[27] 账单跨轮分摊、展示字段降频、日写入预算');
 }
 
 {
-  // 登录会话：滑动续期与「记住我」
+  // 登录会话：7 天滑动续期
   const cfg = baseConfig([]);
   const store = { app_config: JSON.stringify(cfg), app_logs: '[]' };
   let putCount = 0;
@@ -1849,20 +1849,16 @@ console.log('\n[27] 账单跨轮分摊、展示字段降频、日写入预算');
   const token = tokenOf(res);
   const kvKey = `session:${token}`;
   let rec = JSON.parse(store[kvKey] || '{}');
-  check('登录不勾记住我：Cookie 物理上限 30 天', /Max-Age=2592000/.test(res.headers.get('Set-Cookie') || ''), res.headers.get('Set-Cookie'));
-  check('登录不勾记住我：KV 有效期为 12 小时', rec.ttlMs === 12 * 3600 * 1000, rec.ttlMs);
-  check('登录不勾记住我：expiresAt 约为 12 小时后', Math.abs(rec.expiresAt - (Date.now() + 12 * 3600 * 1000)) < 5000, rec.expiresAt);
+  check('登录：Cookie 物理上限 30 天', /Max-Age=2592000/.test(res.headers.get('Set-Cookie') || ''), res.headers.get('Set-Cookie'));
+  check('登录：KV 有效期为 7 天', rec.ttlMs === 7 * 24 * 3600 * 1000, rec.ttlMs);
+  check('登录：expiresAt 约为 7 天后', Math.abs(rec.expiresAt - (Date.now() + 7 * 24 * 3600 * 1000)) < 5000, rec.expiresAt);
 
-  res = await M.default.fetch(H('/api/login', 'POST', { password: 'x', remember: true }), env);
-  const rec2 = JSON.parse(store[`session:${tokenOf(res)}`] || '{}');
-  check('登录勾选记住我：KV 有效期为 30 天', rec2.ttlMs === 30 * 24 * 3600 * 1000, rec2.ttlMs);
-
-  // 剩余 > 50%：不续期
+  // 剩余 > 50%（> 3.5 天）：不续期
   putCount = 0;
   await M.default.fetch(H('/api/state', 'GET', null, `cdt_session=${token}`), env);
   check('剩余 > 50% 时不续期（0 次写）', putCount === 0, putCount);
 
-  // 剩余 < 50%：续期一次
+  // 剩余 < 50%（< 3.5 天）：续期一次
   rec = JSON.parse(store[kvKey]);
   rec.expiresAt = Date.now() + 3600 * 1000;
   store[kvKey] = JSON.stringify(rec);
@@ -1870,16 +1866,16 @@ console.log('\n[27] 账单跨轮分摊、展示字段降频、日写入预算');
   await M.default.fetch(H('/api/state', 'GET', null, `cdt_session=${token}`), env);
   check('剩余 < 50% 时续期一次（1 次写）', putCount === 1, putCount);
   const renewed = JSON.parse(store[kvKey]);
-  check('续期后有效期恢复为 12 小时', Math.abs(renewed.expiresAt - (Date.now() + 12 * 3600 * 1000)) < 5000, renewed.expiresAt);
-  check('续期保留原 ttlMs（不会把 12 小时变成 30 天）', renewed.ttlMs === 12 * 3600 * 1000, renewed.ttlMs);
+  check('续期后有效期恢复为 7 天', Math.abs(renewed.expiresAt - (Date.now() + 7 * 24 * 3600 * 1000)) < 5000, renewed.expiresAt);
+  check('续期保留原 ttlMs', renewed.ttlMs === 7 * 24 * 3600 * 1000, renewed.ttlMs);
 
   // 过期：受保护接口返回 401
-  store[kvKey] = JSON.stringify({ expiresAt: Date.now() - 1000, ttlMs: 12 * 3600 * 1000 });
+  store[kvKey] = JSON.stringify({ expiresAt: Date.now() - 1000, ttlMs: 7 * 24 * 3600 * 1000 });
   res = await M.default.fetch(H('/api/state', 'GET', null, `cdt_session=${token}`), env);
   check('会话过期后受保护接口返回 401', res.status === 401, res.status);
 
   // 登出
-  store[kvKey] = JSON.stringify({ expiresAt: Date.now() + 3600 * 1000, ttlMs: 12 * 3600 * 1000 });
+  store[kvKey] = JSON.stringify({ expiresAt: Date.now() + 3600 * 1000, ttlMs: 7 * 24 * 3600 * 1000 });
   res = await M.default.fetch(H('/api/logout', 'POST', null, `cdt_session=${token}`), env);
   check('登出后 KV 会话被删除', store[kvKey] === undefined, store[kvKey]);
   check('登出清空 Cookie', /Max-Age=0/.test(res.headers.get('Set-Cookie') || ''), res.headers.get('Set-Cookie'));
